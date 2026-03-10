@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+*.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Scan outputs (sensitive - contain target data)
+active_session.json
+triage.json
+triage_round2.json
+pre_auth_summary.md
+final_report.md
+results/
+
+# Wordlists (large, install separately)
+SecLists/
+
+# Misc
+*.log
+.DS_Store
