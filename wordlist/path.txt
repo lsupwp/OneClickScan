@@ -1,0 +1,13 @@
+/dav/
+/webdav/
+/davtest/
+/public/
+/backup/
+/share/
+/storage/
+/remote.php/webdav/
+/servlet/webdav/
+/_vti_bin/
+/web-dav/
+/css/
+/script/

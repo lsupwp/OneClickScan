@@ -591,10 +591,41 @@ class ExploitPipeline:
             # ไม่มี login form เลย → scan ปกติ
             self._phase("4/5  EXECUTE EXPLOITS (Pre-Auth)", self._execute)
 
+        if getattr(self.opts, "json_out", None):
+            self._save_exploit_json(self.opts.json_out)
         print(f"\n{'='*60}\n[*] --run-exploit pipeline complete.")
         print(f"[*] Triage       : {self.triage_eng.file}")
         print(f"[*] Results      : {self.runner.results}/")
         print(f"[*] Final report : {self.root / 'final_report.md'}\n{'='*60}")
+
+    def _save_exploit_json(self, output_path: str) -> None:
+        """บันทึก full pipeline result เป็น JSON"""
+        import json as _json
+        from services.nuclei_service import findings_to_dict
+        triage = {}
+        try:
+            triage = self.triage_eng.load()
+        except Exception:
+            pass
+        cred_path = self.root / "credentials.json"
+        creds = []
+        if cred_path.exists():
+            try:
+                creds = _json.loads(cred_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        nuclei_findings = getattr(self, "_nuclei_findings", [])
+        report = {
+            "target":      self.url,
+            "session":     str(self.sess.cookie_path) if self.sess.cookie_path.exists() else None,
+            "credentials": creds,
+            "triage":      triage,
+            "nuclei":      findings_to_dict(nuclei_findings),
+        }
+        Path(output_path).write_text(
+            _json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"[*] JSON report saved: {output_path}")
 
     def _is_site_gated(self) -> bool:
         """คืน True ถ้า site ส่วนใหญ่ redirect ไป login (ไม่มีหน้า public จริงๆ).
@@ -631,6 +662,10 @@ class ExploitPipeline:
         r.print_paths()
         # gobuster หลัง path_recon — ใช้ session เดียวกัน (re-login อัตโนมัติ)
         self._run_gobuster_into(r)
+        # davtest หลัง gobuster — ตรวจ upload methods บน paths ที่เจอ
+        self._run_davtest_into(r)
+        # nuclei — template scan (pre-auth, no cookie)
+        self._run_nuclei_into(cookie=None)
         r.run_payload(refresh=False)
         r.print_forms()
         t = self.triage_eng.local(r.forms, r.params)
@@ -665,7 +700,7 @@ class ExploitPipeline:
             out = run_gobuster_dir(
                 self.url, str(wl), threads=20, timeout_seconds=10,
                 status_codes="200,204,301,302,307,401,403", status_codes_blacklist="",
-                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=True,
+                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=False,
                 random_agent=False, retry=False, retry_attempts=3, delay="0s",
                 no_error=False, no_progress=True, force=True, quiet=False,
                 on_output_line=lambda l: print(f"[gobuster] {l.strip()}") if "(Status:" in l else None,
@@ -680,6 +715,52 @@ class ExploitPipeline:
             print(f"[*] Gobuster added {added} new path(s) (total: {len(r.paths)})")
         except Exception as e:
             print(f"[!] Gobuster error: {e}", file=sys.stderr)
+
+    def _run_nuclei_into(self, cookie: str | None = None) -> None:
+        """รัน nuclei บน self.url — ไม่ block pipeline ถ้า error"""
+        from services.nuclei_service import (run_nuclei, parse_nuclei_output,
+                                              print_nuclei_results, save_nuclei_json)
+        _hdr("NUCLEI SCAN")
+        print(f"[*] Nuclei: {self.url}  severity=all")
+        try:
+            raw = run_nuclei(
+                self.url,
+                severity=None,   # all severities
+                cookie=cookie,
+                timeout_seconds=300,
+                on_output_line=lambda l: print(f"[nuclei] {l.rstrip()}") if l.strip() else None,
+            )
+            findings = parse_nuclei_output(raw)
+            print_nuclei_results(findings)
+            # auto-save JSON
+            label = "nuclei_post_auth" if cookie else "nuclei_pre_auth"
+            out   = self.runner.results / f"{label}_findings.json"
+            save_nuclei_json(findings, str(out))
+            print(f"[*] Nuclei findings saved: {out}")
+            # เก็บสำหรับ final JSON report
+            self._nuclei_findings = getattr(self, "_nuclei_findings", []) + findings
+        except RuntimeError as e:
+            print(f"[!] Nuclei error: {e}", file=sys.stderr)
+
+    def _run_davtest_into(self, r: ReconEngine) -> None:
+        """รัน DAVTest หลัง gobuster แล้วแสดงผล (ไม่ block pipeline ถ้า error)"""
+        from services.davtest_service import run_davtest, print_davtest_results
+        wl = self.root / "wordlist" / "path.txt"
+        if not wl.exists():
+            print("[*] DAVTest skipped (wordlist/path.txt not found)", file=sys.stderr)
+            return
+        hdrs = None
+        if hasattr(self, "sess") and self.sess is not None:
+            raw = self.sess.headers_list()
+            hdrs = dict(raw) if raw else None
+        _hdr("DAVTEST (WebDAV / Upload Method Probe)")
+        print(f"[*] DAVTest: probing {len(r.paths)} paths against wordlist/path.txt")
+        try:
+            results = run_davtest(self.url, r.paths, str(wl),
+                                  session_headers=hdrs, timeout=10)
+            print_davtest_results(results)
+        except Exception as e:
+            print(f"[!] DAVTest error: {e}", file=sys.stderr)
 
     def _find_login(self) -> dict | None:
         try:
@@ -749,6 +830,11 @@ class ExploitPipeline:
         r.print_paths()
         # gobuster หลัง Katana — re-login อัตโนมัติก่อนส่ง session cookie ไป
         self._run_gobuster_into(r)
+        # davtest หลัง gobuster — ตรวจ upload methods (authenticated)
+        self._run_davtest_into(r)
+        # nuclei — template scan พร้อม session cookie
+        cookie_str = self.sess.cookie_str() if self.sess else None
+        self._run_nuclei_into(cookie=cookie_str)
         r.run_payload()
         r.print_forms()
         t2 = self.triage_eng.post_auth(r.paths, r.forms, r.params)
@@ -802,6 +888,8 @@ class ScanMode:
             self.recon.run_paths()
             if o.path_recon: self.recon.print_paths()
         if getattr(o, "gobuster",   False): self._gobuster()
+        if getattr(o, "davtest",    False): self._davtest()
+        if getattr(o, "nuclei",     False): self._nuclei()
         if getattr(o, "nmap",       False): self._nmap()
         if getattr(o, "whatweb",    False): self._whatweb()
         if getattr(o, "subfinder",  False): self._subfinder()
@@ -836,6 +924,52 @@ class ScanMode:
                 self.triage_eng.show(t2, "AI TRIAGE ROUND 2 (Post-Auth: IDOR, Access Control)")
                 ExploitPipeline(self.url, o)._write_report(t2, paths)
 
+        # ── JSON report รวม (ถ้า --json-out) ──────────────────────────────
+        if getattr(o, "json_out", None):
+            self._save_json_report(o.json_out)
+
+    def _save_json_report(self, output_path: str) -> None:
+        """บันทึก full scan result เป็น JSON เดียว"""
+        import json as _json
+        from services.nuclei_service import findings_to_dict
+        # forms: แปลง set → list
+        def _serialize_forms(forms: dict) -> list:
+            out = []
+            for sig, data in (forms or {}).items():
+                det = (data.get("details") or {}) if isinstance(data, dict) else {}
+                out.append({
+                    "signature": sig,
+                    "method":    det.get("method", ""),
+                    "action":    det.get("target_action", ""),
+                    "body_params":  det.get("body_params", {}),
+                    "query_params": det.get("query_params", {}),
+                })
+            return out
+        def _serialize_params(params: dict) -> list:
+            out = []
+            for sig, ep in (params or {}).items():
+                if isinstance(ep, dict):
+                    out.append({"base_path": ep.get("base_path",""), "params": ep.get("params",{})})
+            return out
+        triage = {}
+        try:
+            triage = self.triage_eng.load()
+        except Exception:
+            pass
+        nuclei_findings = getattr(self, "_nuclei_findings", [])
+        report = {
+            "target":   self.url,
+            "paths":    self.recon.paths,
+            "forms":    _serialize_forms(self.recon.forms),
+            "params":   _serialize_params(self.recon.params),
+            "triage":   triage,
+            "nuclei":   findings_to_dict(nuclei_findings),
+        }
+        Path(output_path).write_text(
+            _json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(f"[*] JSON report saved: {output_path}")
+
     def _gobuster(self) -> None:
         from services.gobuster_service import run_gobuster_dir, parse_gobuster_output
         wl   = str(self.root / "SecLists/Discovery/Web-Content/common.txt")
@@ -845,7 +979,7 @@ class ScanMode:
             out = run_gobuster_dir(
                 self.url, wl, threads=20, timeout_seconds=10,
                 status_codes="200,204,301,302,307,401,403", status_codes_blacklist="",
-                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=True,
+                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=False,
                 random_agent=False, retry=False, retry_attempts=3, delay="0s",
                 no_error=False, no_progress=True, force=True, quiet=False,
                 on_output_line=lambda l: print(f"[gobuster] {l.strip()}") if "(Status:" in l else None,
@@ -864,6 +998,53 @@ class ScanMode:
             self.recon.paths.extend(shown)
         except Exception as e:
             print(f"[!] Gobuster error: {e}", file=sys.stderr)
+
+    def _nuclei(self) -> None:
+        from services.nuclei_service import (run_nuclei, parse_nuclei_output,
+                                              print_nuclei_results, save_nuclei_json)
+        hdrs   = dict(self.sess.headers_list()) if self.sess and self.sess.headers_list() else None
+        cookie = hdrs.pop("Cookie", None) if hdrs else None
+        tags   = getattr(self.opts, "nuclei_tags", None)
+        sev_raw = getattr(self.opts, "nuclei_severity", None)
+        sev    = sev_raw.split(",") if sev_raw else None   # None = all severities
+        _hdr("NUCLEI SCAN")
+        print(f"[*] Nuclei: {self.url}"
+              + (f"  severity={','.join(sev)}" if sev else "  severity=all")
+              + (f"  tags={tags}" if tags else ""))
+        try:
+            raw = run_nuclei(
+                self.url,
+                tags=tags.split(",") if tags else None,
+                severity=sev,
+                cookie=cookie,
+                extra_headers=hdrs,
+                timeout_seconds=getattr(self.opts, "timeout", 300),
+                on_output_line=lambda l: print(f"[nuclei] {l.rstrip()}") if l.strip() else None,
+            )
+            findings = parse_nuclei_output(raw)
+            print_nuclei_results(findings)
+            # auto-save JSON
+            out_dir = self.root / getattr(self.opts, "results_dir", "results")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            save_nuclei_json(findings, str(out_dir / "nuclei_findings.json"))
+            print(f"[*] Nuclei findings saved: {out_dir / 'nuclei_findings.json'}")
+            # เก็บไว้สำหรับ --json-out รวม
+            self._nuclei_findings = findings
+        except RuntimeError as e:
+            print(f"[!] Nuclei error: {e}", file=sys.stderr)
+
+    def _davtest(self) -> None:
+        from services.davtest_service import run_davtest, print_davtest_results
+        wl   = str(self.root / "wordlist" / "path.txt")
+        hdrs = dict(self.sess.headers_list()) if self.sess and self.sess.headers_list() else None
+        _hdr("DAVTEST (WebDAV / Upload Method Probe)")
+        print(f"[*] DAVTest: probing {len(self.recon.paths)} paths against wordlist/path.txt")
+        try:
+            results = run_davtest(self.url, self.recon.paths, wl,
+                                  session_headers=hdrs, timeout=10)
+            print_davtest_results(results)
+        except Exception as e:
+            print(f"[!] DAVTest error: {e}", file=sys.stderr)
 
     def _nmap(self) -> None:
         from services.nmap_service import run_nmap_scan, parse_nmap_services, get_cve_info
@@ -905,7 +1086,8 @@ class ScanMode:
         scheme = urlparse(self.url).scheme or "http"
         try:
             subs  = run_subfinder(root)
-            alive = run_httpx([f"{scheme}://{s}" for s in subs]) if subs else []
+            # ส่ง bare hostname — httpx probe ทั้ง http+https เอง
+            alive = run_httpx(subs) if subs else []
             _hdr("SUBFINDER (Subdomains)")
             print(f"Root domain: {root}")
             print(f"Total found: {len(subs)}  |  Alive (httpx): {len(alive)}")
@@ -1019,9 +1201,17 @@ def main() -> None:
     parser.add_argument("--whatweb-cve",    action="store_true")
     parser.add_argument("--whatweb-cve-limit", type=int, default=5, metavar="N")
     parser.add_argument("--gobuster",       action="store_true")
+    parser.add_argument("--davtest",        action="store_true",
+                        help="Probe discovered paths for WebDAV/PUT upload methods (runs after gobuster)")
+    parser.add_argument("--nuclei",         action="store_true",
+                        help="Run nuclei template scan (cve, misconfig, exposure, ...)")
+    parser.add_argument("--nuclei-tags",    default=None, metavar="TAGS",
+                        help="Comma-separated nuclei tags, e.g. cve,sqli,xss (default: cve,misconfig,exposure,...)")
+    parser.add_argument("--nuclei-severity", default=None, metavar="SEV",
+                        help="Comma-separated severity filter, e.g. critical,high,medium (default: critical,high,medium)")
     parser.add_argument("--subfinder",      action="store_true")
     parser.add_argument("--all",            action="store_true",
-                        help="Enable path-recon + payload-recon + nmap + whatweb + gobuster + subfinder")
+                        help="Enable path-recon + payload-recon + nmap + whatweb + gobuster + davtest + nuclei + subfinder")
     parser.add_argument("--cookie-file",    default=None, metavar="FILE",
                         help="Session cookie file (active_session.json)")
     parser.add_argument("--post-auth",      action="store_true",
@@ -1036,6 +1226,8 @@ def main() -> None:
     parser.add_argument("--timeout",        type=int, default=300, metavar="SEC")
     parser.add_argument("--workers",        type=int, default=4,   metavar="N")
     parser.add_argument("--no-rescan-prompt", action="store_true")
+    parser.add_argument("--json-out",        default=None, metavar="FILE",
+                        help="Save full scan result as JSON (e.g. scan_result.json)")
     parser.add_argument("--user-file",      default=None, metavar="FILE")
     parser.add_argument("--pass-file",      default=None, metavar="FILE")
 
@@ -1047,7 +1239,8 @@ def main() -> None:
                    else "triage.json")
 
     _scan_flags = (args.path_recon or args.payload_recon or args.nmap or args.whatweb
-                   or args.gobuster or args.subfinder or args.auto_triage or args.ai_triage
+                   or args.gobuster or args.davtest or args.nuclei or args.subfinder
+                   or args.auto_triage or args.ai_triage
                    or args.post_auth or args.all or args.run_exploit)
 
     # ── dispatch ──
@@ -1058,7 +1251,7 @@ def main() -> None:
     elif url and _scan_flags:
         if args.all:
             args.path_recon = args.payload_recon = True
-            args.nmap = args.whatweb = args.gobuster = args.subfinder = True
+            args.nmap = args.whatweb = args.gobuster = args.davtest = args.nuclei = args.subfinder = True
         if args.ai_triage or args.auto_triage:
             args.payload_recon = True
         ScanMode(url, args).run()
