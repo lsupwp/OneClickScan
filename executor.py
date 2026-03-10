@@ -1,799 +1,1075 @@
 #!/usr/bin/env python3
 """
-Executor - อ่าน triage.json จาก AI Triage / Auto Triage แล้วรันคำสั่งที่แนะนำ
-- Filter: เลือกรันเฉพาะ [high] หรือทั้งหมด
-- Safety: ตรวจสอบว่ามี Tool ติดตั้งก่อนรัน
-- Logging: เก็บ output แยกไฟล์ใน results/ ตามชื่อ Tool และ Parameter
-- CSRF: ดึง token ก่อนส่งคำสั่งให้ tool (และใช้ใน post-exploit login)
-- Post-Exploit: Login ด้วย credential ที่พบ, บันทึก session, ถามรัน High-Level Scan (main.py --cookie-file)
+OneClickScan V2 — unified scanner + executor
+
+Modes:
+  python executor.py scan  -u URL [opts]   # recon + triage  (เดิม main.py)
+  python executor.py exec  [triage.json]   # run triage cmds (เดิม executor.py)
+  python executor.py run   -u URL          # full pipeline   (เดิม --run-exploit)
+
+Legacy compat (no subcommand → exec mode):
+  python executor.py --min-confidence medium --workers 6
 """
 from __future__ import annotations
-
-import argparse
-import json
-import re
-import shutil
-import subprocess
-import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urlparse
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
+
+import argparse, json, re, shutil, subprocess, sys, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-
-def load_triage(path: str | Path) -> dict:
-    """โหลด triage.json"""
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Triage file not found: {p}")
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
-
-
-_ORDER = {"high": 3, "medium": 2, "low": 1}
-
-
-def filter_targets(targets: list, min_confidence: str | None) -> list:
-    """
-    กรอง targets ตาม min_confidence: high = เฉพาะ high, medium = high+medium, low/None = ทั้งหมด
-    """
-    if not min_confidence or min_confidence.lower() == "low":
-        return list(targets)
-    min_level = _ORDER.get(min_confidence.lower(), 0)
-    out = []
-    for t in targets:
-        c = (t.get("confidence") or "low").lower()
-        level = _ORDER.get(c, 1)
-        if level >= min_level:
-            out.append(t)
-    return out
-
-
-def _print_post_scan_summary(project_root: Path) -> None:
-    """สรุปผลหลังผู้ใช้ตอบไม่สแกนต่อ (report path, triage round2, จำนวน targets)."""
-    project_root = Path(project_root)
-    lines = ["\n" + "=" * 60, "สรุปผลการสแกน", "=" * 60]
-    report_path = project_root / "final_report.md"
-    if report_path.exists():
-        lines.append(f"  รายงานรวม: {report_path}")
-    triage2_path = project_root / "triage_round2.json"
-    if triage2_path.exists():
-        try:
-            data = json.loads(triage2_path.read_text(encoding="utf-8"))
-            targets = data.get("targets", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-            high = sum(1 for t in targets if isinstance(t, dict) and (t.get("confidence") or "").lower() == "high")
-            med = sum(1 for t in targets if isinstance(t, dict) and (t.get("confidence") or "").lower() == "medium")
-            low = sum(1 for t in targets if isinstance(t, dict) and (t.get("confidence") or "").lower() == "low")
-            lines.append(f"  Post-Auth Triage: {triage2_path} (high: {high}, medium: {med}, low: {low})")
-        except Exception:
-            lines.append(f"  Post-Auth Triage: {triage2_path}")
-    lines.append(f"  ผลรันคำสั่ง: {project_root / 'results'}")
-    lines.append(f"  Triage รอบแรก: {project_root / 'triage.json'}")
-    lines.append("=" * 60)
-    print("\n".join(lines))
-
-
-def extract_tool_name(cmd: str) -> str | None:
-    """ดึงชื่อคำสั่งตัวแรกจาก command string (ไม่นับ path ใน quoted URL)"""
-    cmd = (cmd or "").strip()
-    if not cmd:
-        return None
-    # แยกแบบง่าย: หา token แรกที่ไม่อยู่ใน quotes
-    in_quote = None
-    token = []
-    i = 0
-    while i < len(cmd):
-        c = cmd[i]
-        if c in "\"'" and (not in_quote or in_quote == c):
-            in_quote = None if in_quote else c
-            i += 1
-            continue
-        if in_quote:
-            i += 1
-            continue
-        if c in " \t":
-            if token:
-                break
-            i += 1
-            continue
-        token.append(c)
-        i += 1
-    name = "".join(token)
-    # ถ้าเป็น path เช่น /usr/bin/sqlmap ใช้แค่ชื่อไฟล์
-    if "/" in name:
-        name = name.split("/")[-1]
-    return name or None
-
-
-def tool_available(tool: str) -> bool:
-    """ตรวจสอบว่าเครื่องมีคำสั่งนี้หรือไม่ (which)"""
-    if not tool:
-        return False
-    return shutil.which(tool) is not None
-
-
-def endpoint_to_slug(endpoint: str, max_len: int = 40) -> str:
-    """แปลง endpoint เป็นชื่อไฟล์ที่ปลอดภัย (ไม่มี / : ? & =)"""
-    if not endpoint:
-        return "unknown"
-    # เอา path จาก URL หรือใช้ทั้งก้อน
-    if "://" in endpoint:
-        endpoint = urlparse(endpoint).path or endpoint
-    slug = re.sub(r"[^\w\-.]", "_", endpoint).strip("_")
-    slug = re.sub(r"_+", "_", slug)[:max_len]
-    return slug or "unknown"
-
-
-def get_csrf_token(
-    url: str,
-    token_name: str = "user_token",
-    timeout: int = 10,
-    session: requests.Session | None = None,
-) -> str | None:
-    """
-    ดึงค่า value จาก <input type="hidden" name="token_name" value="..."> ในหน้า url.
-    ใช้ BeautifulSoup ก่อน แล้ว fallback เป็น regex.
-    """
-    try:
-        if session is not None:
-            resp = session.get(url, timeout=timeout, allow_redirects=True)
-        else:
-            resp = requests.get(url, timeout=timeout, allow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text or ""
-    except Exception:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-    inp = soup.find("input", {"type": "hidden", "name": token_name})
-    if inp and inp.get("value"):
-        return inp.get("value")
-    # Fallback: regex หา name=token_name value="..."
-    re_pattern = re.compile(
-        rf'<input[^>]+name=["\']({re.escape(token_name)})["\'][^>]+value=["\']([^"\']+)["\']',
-        re.I,
-    )
-    m = re_pattern.search(html)
-    if m:
-        return m.group(2)
-    re_pattern2 = re.compile(
-        rf'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']({re.escape(token_name)})["\']',
-        re.I,
-    )
-    m2 = re_pattern2.search(html)
-    if m2:
-        return m2.group(1)
-    return None
-
-
-def _response_looks_authenticated(resp: requests.Response, login_url: str) -> bool:
-    """
-    เช็คว่าหน้า response ดูเหมือน login สำเร็จจริง ไม่ใช่ยังเด้งกลับหน้า login.
-    """
-    if resp.status_code >= 400:
-        return False
-    body = (resp.text or "").lower()
-    final_url = (resp.url or "").lower()
-    login_name = (urlparse(login_url).path.rsplit("/", 1)[-1] or "").lower()
-
-    fail_markers = ("incorrect", "login failed", "invalid", "wrong password", "authentication failed")
-    if any(marker in body for marker in fail_markers):
-        return False
-
-    success_markers = ("logout", "welcome", "dashboard", "instructions.php", "dvwa security", "php info")
-    if any(marker in body for marker in success_markers):
-        return True
-
-    soup = BeautifulSoup(resp.text or "", "html.parser")
-    for form in soup.find_all("form"):
-        fields = {
-            (inp.get("name") or "").strip().lower()
-            for inp in form.find_all("input")
-            if inp.get("name")
-        }
-        if fields and any(name in fields for name in ("username", "user", "uname")) and any(
-            name in fields for name in ("password", "pass", "pwd")
-        ):
-            return False
-
-    if resp.history and login_name and login_name not in final_url:
-        return True
-
-    if "login" in final_url and login_name and login_name in final_url:
-        return False
-
-    return len(resp.history) > 0
-
-
-def load_cookie_header(cookie_file: str | Path) -> str | None:
-    """
-    อ่านไฟล์ cookie (active_session.json) แล้วคืนค่า Cookie header string.
-    รองรับรูปแบบ: {"Cookie": "a=b; c=d"} หรือ {"cookies": [{"name","value"}, ...]}
-    """
-    p = Path(cookie_file)
-    if not p.exists():
-        return None
-    try:
-        with open(p, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return None
-    if isinstance(data, dict) and data.get("Cookie"):
-        return data["Cookie"].strip()
-    if isinstance(data, dict) and data.get("cookies"):
-        parts = [f"{c.get('name','')}={c.get('value','')}" for c in data["cookies"] if c.get("name")]
-        return "; ".join(parts) if parts else None
-    return None
-
-
-def _hydra_target_to_hostport(url: str) -> str:
-    """แปลง URL เป็น host:port สำหรับ Hydra (target ต้องไม่มี scheme)."""
-    u = urlparse(url)
-    host = u.hostname or u.netloc or "127.0.0.1"
-    port = u.port
-    if port is not None:
-        return f"{host}:{port}"
-    if u.scheme == "https":
-        return f"{host}:443"
-    return host
-
-
-def _normalize_hydra_command(cmd: str) -> str:
-    """แก้ target ในคำสั่ง hydra จาก http(s)://host เป็น host:port เพื่อไม่ให้ Invalid target definition."""
-    # ตรงที่อยู่ก่อน "http-post-form" คือ target; ถ้าเป็น URL ต้องแปลง
-    m = re.search(r"(\s)(https?://[^/\s]+(?::\d+)?)(\s+http-post-form)", cmd)
-    if m:
-        prefix, url, suffix = m.group(1), m.group(2), m.group(3)
-        return cmd.replace(m.group(0), prefix + _hydra_target_to_hostport(url) + suffix, 1)
-    return cmd
-
-
-def inject_cookie_into_command(cmd: str, tool: str, cookie_header: str) -> str:
-    """
-    ฉีด Cookie header เข้า command ตามรูปแบบของแต่ละ tool.
-    sqlmap: --cookie="..."
-    xsstrike: --headers "Cookie: ..."
-    hydra: ไม่เปลี่ยน (มักใช้กับ login ก่อนมี session)
-    """
-    if not cookie_header or not cmd.strip():
-        return cmd
-    cookie_escaped = cookie_header.replace('"', '\\"')
-    tool_lower = (tool or "").lower()
-    if tool_lower == "sqlmap":
-        if "--cookie=" in cmd or "--cookie " in cmd:
-            return cmd
-        return cmd.rstrip() + f' --cookie="{cookie_escaped}"'
-    if tool_lower == "xsstrike":
-        if "--headers" in cmd:
-            return cmd
-        return cmd.rstrip() + f' --headers "Cookie: {cookie_escaped}"'
-    return cmd
-
-
-def run_command(cmd: str, timeout: int | None = 300) -> tuple[str, str, int]:
-    """รันคำสั่งด้วย subprocess.run; คืน (stdout, stderr, returncode)."""
-    try:
-        r = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=Path(__file__).resolve().parent,
-        )
-        return (r.stdout or "", r.stderr or "", r.returncode)
-    except subprocess.TimeoutExpired:
-        return ("", "Command timed out.", -1)
-    except Exception as e:
-        return ("", str(e), -1)
-
-
-# รูปแบบ output ของ Hydra เมื่อพบ password (บรรทัด [host] login: user   password: pass)
-_HYDRA_LOGIN_RE = re.compile(
-    r"\[\d+\]\[[\w-]+\]\s+host:\s+login:\s+(?P<login>\S+)\s+password:\s+(?P<password>\S+)",
-    re.I,
+# ── constants / tiny helpers ───────────────────────────────────────────
+_UA       = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+_ORDER    = {"high": 3, "medium": 2, "low": 1}
+_TOK_KEYS = ("token", "csrf", "_sync", "_token", "authenticity_token", "sync")
+_FAIL_MK  = ("incorrect", "login failed", "invalid", "wrong password", "authentication failed")
+_OK_MK    = ("logout", "welcome", "dashboard", "instructions.php", "dvwa security", "php info")
+_CRED_RE  = re.compile(r"CREDENTIAL:\t(?P<u>[^\t]+)\t(?P<p>.+)")
+_HYDRA_RE = re.compile(
+    r"\[\d+\]\[[\w-]+\]\s+host:\s+login:\s+(?P<u>\S+)\s+password:\s+(?P<p>\S+)", re.I
 )
-# รูปแบบ output ของ bruter.py
-_BRUTER_CREDENTIAL_RE = re.compile(r"CREDENTIAL:\t(?P<login>[^\t]+)\t(?P<password>.+)")
-
-# คีย์ใน form ที่นับว่าเป็น token/CSRF (ถ้ามี = ใช้ bruter แทน hydra)
-_TOKEN_LIKE_KEYS = ("token", "csrf", "_sync", "_token", "authenticity_token", "sync")
 
 
-def has_token_like_param(body_params: list | dict) -> tuple[bool, str | None]:
-    """
-    ตรวจจากรายการ parameters ว่ามีชื่อที่เหมือน token/csrf/_sync หรือค่าสุ่มหรือไม่.
-    คืน (True, csrf_field_name) ถ้าพบ, (False, None) ถ้าไม่พบ.
-    """
-    if isinstance(body_params, dict):
-        keys = list(body_params.keys())
-    else:
-        keys = list(body_params) if body_params else []
+def _scheme(u: str) -> str:
+    return u if u.startswith(("http://", "https://")) else "http://" + u
+
+
+def _slug(ep: str, n: int = 40) -> str:
+    s = urlparse(ep).path if "://" in ep else ep
+    return (re.sub(r"_+", "_", re.sub(r"[^\w\-.]", "_", s)).strip("_") or "unknown")[:n]
+
+
+def _first_token(cmd: str) -> str | None:
+    t = (cmd or "").strip().split()[0] if cmd.strip() else ""
+    return (t.split("/")[-1] or None) if t else None
+
+
+def _available(tool: str) -> bool:
+    return bool(tool and shutil.which(tool))
+
+
+def _has_token(params: list | dict) -> tuple[bool, str | None]:
+    keys = list(params.keys() if isinstance(params, dict) else params)
     for k in keys:
-        k_lower = str(k).lower()
-        for t in _TOKEN_LIKE_KEYS:
-            if t in k_lower:
-                return (True, str(k))
-    return (False, None)
+        if any(t in str(k).lower() for t in _TOK_KEYS):
+            return True, str(k)
+    return False, None
 
 
-def parse_credentials_from_log(log_path: str | Path) -> list[tuple[str, str]]:
-    """
-    อ่านไฟล์ log จาก hydra / bruter แล้วคืนรายการ (username, password) ที่พบ.
-    รองรับรูปแบบ hydra และ CREDENTIAL:\\tuser\\tpass จาก bruter.py
-    """
-    path = Path(log_path)
-    if not path.exists():
-        return []
-    found: list[tuple[str, str]] = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return []
-    for m in _HYDRA_LOGIN_RE.finditer(text):
-        login = (m.group("login") or "").strip()
-        password = (m.group("password") or "").strip()
-        if login and (login, password) not in found:
-            found.append((login, password))
-    for m in _BRUTER_CREDENTIAL_RE.finditer(text):
-        login = (m.group("login") or "").strip()
-        password = (m.group("password") or "").strip()
-        if login and (login, password) not in found:
-            found.append((login, password))
-    return found
+def _filter_targets(targets: list, min_confidence: str | None) -> list:
+    if not min_confidence or min_confidence == "low":
+        return list(targets)
+    lvl = _ORDER.get(min_confidence, 0)
+    return [t for t in targets if _ORDER.get((t.get("confidence") or "low").lower(), 1) >= lvl]
 
 
-def post_exploit_login(
-    login_url: str,
-    username: str,
-    password: str,
-    form_body_params: dict[str, str] | None,
-    cookie_file: str | Path,
-    csrf_token_name: str = "user_token",
-    timeout: int = 15,
-) -> bool:
-    """
-    Login จริงด้วย requests.Session(); ถ้าหน้า Login มี CSRF จะดึง token มาใส่ใน payload.
-    เมื่อสำเร็จบันทึก cookies ลง active_session.json (cookie_file).
-    form_body_params = dict ของชื่อ field -> value; จะแทน uname/user/username ด้วย username, pass/password ด้วย password.
-    """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    })
-    try:
-        # ดึง CSRF ถ้ามี
-        csrf_val = get_csrf_token(
-            login_url,
-            token_name=csrf_token_name,
-            timeout=timeout,
-            session=session,
+def _hdr(title: str) -> None:
+    print(f"\n{'='*80}\n{title}\n{'='*80}")
+
+
+# ── SessionManager ─────────────────────────────────────────────────────
+class SessionManager:
+    """Loads, saves, refreshes session cookies; handles login + CSRF."""
+
+    def __init__(self, root: Path, cookie_file: str | None = None):
+        self.root        = root
+        self.cookie_path = Path(cookie_file).resolve() if cookie_file else root / "active_session.json"
+        self.cred_path   = self.cookie_path.parent / "credentials.json"
+
+    # loaders
+    def cookie_str(self) -> str | None:
+        d = self._json(self.cookie_path)
+        if not d: return None
+        if d.get("Cookie"): return d["Cookie"].strip()
+        if d.get("cookies"):
+            return "; ".join(f"{c['name']}={c['value']}" for c in d["cookies"] if c.get("name")) or None
+        return None
+
+    def headers_list(self) -> list[tuple] | None:
+        cs = self.cookie_str()
+        if not cs: return None
+        print(f"[*] Loaded session from {self.cookie_path.name} ({len(cs.split(';'))} cookies)")
+        return [("Cookie", cs), ("User-Agent", _UA)]
+
+    # login / session lifecycle
+    def login(self, url: str, user: str, pwd: str, form: dict,
+              csrf_field: str = "user_token", timeout: int = 15) -> bool:
+        sess = requests.Session()
+        sess.headers["User-Agent"] = _UA
+        try:
+            csrf = self._csrf(url, csrf_field, sess, timeout)
+            body = dict(form)
+            for k in body:
+                kl = k.lower()
+                if kl in ("username", "user", "uname", "login"): body[k] = user
+                elif kl in ("password", "pass", "pwd"):           body[k] = pwd
+            if csrf: body[csrf_field] = csrf
+            r = sess.post(url, data=body, timeout=timeout, allow_redirects=True)
+            if not self._looks_ok(r, url): return False
+            base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+            verified = any(
+                self._looks_ok(sess.get(c, timeout=timeout, allow_redirects=True), url)
+                for c in [base + "/", base + "/index.php"]
+            )
+            if not verified: return False
+            self._save(sess, url)
+            return True
+        except Exception:
+            return False
+
+    def refresh(self) -> list[tuple] | None:
+        cred = self._json(self.cred_path)
+        if not cred or not cred.get("url") or not cred.get("username"): return None
+        try:
+            sess = requests.Session()
+            sess.headers["User-Agent"] = _UA
+            r   = sess.get(cred["url"], timeout=10, allow_redirects=True)
+            cf  = cred.get("csrf_field", "user_token")
+            inp = BeautifulSoup(r.text, "html.parser").find("input", {"name": cf})
+            csrf = inp["value"] if inp and inp.get("value") else None
+            body = dict(cred.get("form_params") or {})
+            for k in body:
+                kl = k.lower()
+                if kl in ("username", "user", "uname", "login"): body[k] = cred["username"]
+                elif kl in ("password", "pass", "pwd"):           body[k] = cred["password"]
+            if csrf: body[cf] = csrf
+            sess.post(cred["url"], data=body, timeout=10, allow_redirects=True)
+            cs = "; ".join(f"{c.name}={c.value}" for c in sess.cookies)
+            if not cs: return None
+            self._save(sess, cred["url"])
+            print(f"[*] Session refreshed (re-login as {cred['username']}) before payload recon.")
+            return [("Cookie", cs), ("User-Agent", _UA)]
+        except Exception as e:
+            print(f"[!] Session refresh failed: {e}", file=sys.stderr)
+            return None
+
+    def save_creds(self, url, user, pwd, form, csrf_field) -> None:
+        self.cred_path.write_text(
+            json.dumps({"url": url, "username": user, "password": pwd,
+                        "form_params": form, "csrf_field": csrf_field},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8"
         )
-        body: dict[str, str] = dict(form_body_params or {})
-        # แทนที่ field login
-        for key in list(body.keys()):
-            k_lower = key.lower()
-            if k_lower in ("username", "user", "uname", "login"):
-                body[key] = username
-            elif k_lower in ("password", "pass", "pwd"):
-                body[key] = password
-        if csrf_val:
-            body[csrf_token_name] = csrf_val
-        resp = session.post(login_url, data=body, timeout=timeout, allow_redirects=True)
-        if not _response_looks_authenticated(resp, login_url):
-            return False
 
-        parsed_login = urlparse(login_url)
-        base_url = f"{parsed_login.scheme}://{parsed_login.netloc}"
-        # ตรวจ login_url เองก่อน แล้ว probe root + index — ไม่ hardcode path เฉพาะ app ใด
-        login_path = parsed_login.path.lstrip("/") or ""
-        verify_candidates = list(dict.fromkeys([  # unique, preserve order
-            base_url + "/",
-            base_url + "/" + login_path if login_path else base_url + "/",
-            base_url + "/index.php",
-        ]))
-        verified = False
-        for candidate in verify_candidates:
+    def parse_creds(self, log_dir: Path) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for f in log_dir.glob("*.log"):
             try:
-                verify_resp = session.get(candidate, timeout=timeout, allow_redirects=True)
+                txt = f.read_text(encoding="utf-8", errors="ignore")
+                for m in [*_HYDRA_RE.finditer(txt), *_CRED_RE.finditer(txt)]:
+                    c = (m.group("u").strip(), m.group("p").strip())
+                    if c[0] and c not in found: found.append(c)
             except Exception:
-                continue
-            if _response_looks_authenticated(verify_resp, login_url):
-                verified = True
-                break
-        if not verified:
-            return False
+                pass
+        return found
 
-        # บันทึก session
-        cookies_list = [
-            {"name": c.name, "value": c.value}
-            for c in session.cookies
+    # ── private helpers ──
+    def _csrf(self, url, field, sess, timeout=10) -> str | None:
+        try:
+            r   = sess.get(url, timeout=timeout, allow_redirects=True)
+            inp = BeautifulSoup(r.text, "html.parser").find("input", {"type": "hidden", "name": field})
+            if inp and inp.get("value"): return inp["value"]
+            for pat in [
+                rf'<input[^>]+name=["\']({re.escape(field)})["\'][^>]+value=["\']([^"\']+)["\']',
+                rf'<input[^>]+value=["\']([^"\']+)["\'][^>]+name=["\']({re.escape(field)})["\']',
+            ]:
+                m = re.search(pat, r.text, re.I)
+                if m: return m.group(2 if "name" in pat[:20] else 1)
+        except Exception:
+            pass
+        return None
+
+    def _looks_ok(self, resp, login_url) -> bool:
+        if resp.status_code >= 400: return False
+        body = (resp.text or "").lower()
+        if any(m in body for m in _FAIL_MK): return False
+        if any(m in body for m in _OK_MK):   return True
+        for form in BeautifulSoup(resp.text or "", "html.parser").find_all("form"):
+            fields = {(i.get("name") or "").lower() for i in form.find_all("input") if i.get("name")}
+            if (any(n in fields for n in ("username","user","uname")) and
+                    any(n in fields for n in ("password","pass","pwd"))):
+                return False
+        ln = (urlparse(login_url).path.rsplit("/", 1)[-1] or "").lower()
+        fu = (resp.url or "").lower()
+        if resp.history and ln and ln not in fu: return True
+        if "login" in fu and ln and ln in fu:   return False
+        return len(resp.history) > 0
+
+    def _save(self, sess, url) -> None:
+        cs  = [{"name": c.name, "value": c.value} for c in sess.cookies]
+        data = {"url": url,
+                "Cookie": "; ".join(f"{c.name}={c.value}" for c in sess.cookies),
+                "cookies": cs}
+        self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        self.cookie_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _json(path: Path) -> dict | None:
+        try:
+            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        except Exception:
+            return None
+
+
+# ── ReconEngine ────────────────────────────────────────────────────────
+class ReconEngine:
+    """Katana path crawl + payload/form extraction."""
+
+    def __init__(self, url: str, session: SessionManager | None = None):
+        self.url     = _scheme(url)
+        self.session = session
+        self.paths:  list[str] = []
+        self.forms:  dict      = {}
+        self.params: dict      = {}
+
+    def run_paths(self, depth: int = 5) -> list[str]:
+        from services.path_recon import run_katana, discover_links_from_authenticated_page
+        hdrs = self.session.headers_list() if self.session else None
+        try:
+            self.paths = list(run_katana(self.url, True, True, hdrs, depth=depth))
+            if hdrs:
+                seen = set(self.paths)
+                for p in discover_links_from_authenticated_page(self.url.rstrip("/") + "/", hdrs, timeout=15):
+                    if p not in seen: seen.add(p); self.paths.append(p)
+        except Exception as e:
+            print(f"[!] Path recon error: {e}", file=sys.stderr)
+        return self.paths
+
+    def run_payload(self, paths: list[str] | None = None, refresh: bool = True) -> tuple[dict, dict]:
+        from services.payload_recon import run_payload_recon
+        ps       = list(paths or self.paths)
+        hdrs_list = self.session.headers_list() if self.session else None
+        if hdrs_list and self.session and refresh:
+            fresh = self.session.refresh()
+            if fresh: hdrs_list = fresh
+        hdrs = dict(hdrs_list) if hdrs_list else None
+        if hdrs:
+            skip = ("logout", "signout", "logoff", "/exit", "sign-out", "log-out")
+            b4   = len(ps)
+            ps   = [p for p in ps if not any(s in urlparse(p).path.lower() for s in skip)]
+            if b4 != len(ps):
+                print(f"[*] Excluded {b4-len(ps)} session-destructive paths (e.g. logout) from payload recon.")
+        valid = []
+        for p in ps:
+            if not p.startswith("http"): valid.append(p); continue
+            try:
+                if requests.get(p, headers=hdrs, timeout=5, allow_redirects=True).status_code != 404:
+                    valid.append(p)
+            except Exception:
+                valid.append(p)
+        removed = len(ps) - len(valid)
+        if removed: print(f"[*] Filtered {removed} paths (404) before payload recon.")
+        self.forms, self.params = run_payload_recon(valid, max_workers=1, extra_headers=hdrs)
+        return self.forms, self.params
+
+    def print_paths(self) -> None:
+        _hdr("PATH RECON (Katana)")
+        print(f"Total paths: {len(self.paths)}")
+        for p in self.paths: print(f"  {p}")
+
+    def print_forms(self) -> None:
+        _hdr("CATEGORY 1: HTML FORMS (POST/GET)")
+        for _, d in self.forms.items():
+            f = d["details"]
+            print(f"\nFound in Paths: {list(d['paths'])}")
+            print(f"  - Action: {f['target_action']} [{f['method']}]")
+            print(f"  - Parameters: {f['body_params']}")
+            if f.get("query_params"): print(f"  - Query String: {f['query_params']}")
+        _hdr("CATEGORY 2: URL QUERY PARAMETERS (Inferred Forms)")
+        if not self.params: print("No URL parameters discovered.")
+        for _, d in self.params.items():
+            print(f"\nBase Path: {d['base_path']}")
+            print(f"  - Parameters: {d['params']}")
+            print(f"  - Sample URLs: {list(d['example_urls'])[:3]}")
+
+
+# ── TriageEngine ───────────────────────────────────────────────────────
+class TriageEngine:
+    """Local heuristic triage, Gemini AI triage, post-auth round-2."""
+
+    def __init__(self, url: str, out_file: str = "triage.json"):
+        self.url  = url
+        self.file = Path(out_file)
+
+    def local(self, forms, params) -> dict:
+        from services.local_triage_service import run_local_triage
+        return run_local_triage(self.url, forms, params)
+
+    def ai(self, paths, forms, params) -> dict:
+        from services.ai_triage_service import run_ai_triage, apply_real_base_to_commands
+        t = run_ai_triage(self.url, paths, forms, params, use_localhost_in_prompt=True)
+        apply_real_base_to_commands(t, self.url)
+        return t
+
+    def post_auth(self, paths, forms, params) -> dict:
+        from services.ai_triage_service import (run_ai_triage_round2,
+                                                 apply_real_base_to_commands,
+                                                 build_post_auth_triage_fallback)
+        try:
+            t = run_ai_triage_round2(self.url, paths, forms, params, use_localhost_in_prompt=True)
+            if t.get("error"):
+                print(f"[!] AI Triage Round 2 API error: {t['error']} — using local fallback", file=sys.stderr)
+                return build_post_auth_triage_fallback(self.url, paths, forms, params)
+            apply_real_base_to_commands(t, self.url)
+            return t
+        except Exception as e:
+            print(f"[!] AI Triage Round 2 failed: {e} — using local fallback", file=sys.stderr)
+            from services.ai_triage_service import build_post_auth_triage_fallback
+            return build_post_auth_triage_fallback(self.url, paths, forms, params)
+
+    def save(self, t: dict) -> None:
+        self.file.write_text(json.dumps(t, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def load(self) -> dict:
+        if not self.file.exists():
+            raise FileNotFoundError(f"Triage not found: {self.file}")
+        return json.loads(self.file.read_text(encoding="utf-8"))
+
+    def show(self, t: dict, label: str = "TRIAGE") -> None:
+        _hdr(label)
+        print(f"Saved: {self.file}")
+        for item in (t.get("targets") or []):
+            if not isinstance(item, dict): continue
+            print(f"\n  [{item.get('confidence','')}] {item.get('endpoint')} [{item.get('method')}]")
+            print(f"    Suspected: {item.get('suspected_issue_types', [])}")
+            for c in (item.get("suggested_commands") or []):
+                print(f"    $ {c}")
+
+
+# ── CommandRunner ──────────────────────────────────────────────────────
+class CommandRunner:
+    """Execute suggested commands from triage; supports bruter, cookie injection."""
+
+    _DEFAULT_PASS = "SecLists/Passwords/Common-Credentials/10k-most-common.txt"
+
+    def __init__(self, root: Path, session: SessionManager | None = None,
+                 results_dir: str = "results", timeout: int = 300):
+        self.root     = root
+        self.session  = session
+        self.timeout  = timeout
+        self.results  = root / results_dir
+        self.results.mkdir(parents=True, exist_ok=True)
+        self._lock    = threading.Lock()
+        pf = root / self._DEFAULT_PASS
+        self._pass    = pf if pf.exists() else Path("/usr/share/wordlists/rockyou.txt")
+
+    def run(self, triage: dict, min_confidence: str | None = None,
+            workers: int = 4, dry_run: bool = False, user_file: str | None = None) -> None:
+        targets = _filter_targets(triage.get("targets") or [], min_confidence)
+        if not targets:
+            print("[!] No targets match filter.", file=sys.stderr)
+            return
+        cmds, bruters = self._build(targets)
+        cookie = self.session.cookie_str() if self.session else None
+        print(f"[*] Output directory: {self.results.resolve()}")
+        lvl = "high only" if min_confidence == "high" else "high + medium" if min_confidence == "medium" else "all"
+        print(f"[*] Mode: min-confidence {lvl}")
+        if bruters: print(f"[*] Bruter jobs (form with token): {len(bruters)} (override hydra)")
+        if dry_run:
+            for cmd, t, *_ in cmds: print(f"  {t}: {cmd[:80]}")
+            for j in bruters:       print(f"  bruter: {j['url'][:60]}... (csrf={j['csrf_field']})")
+            print("[*] Dry run — no execution.")
+            return
+        total = len(cmds)
+        print(f"[*] Commands to run: {total} (workers: {workers})" +
+              (f" + {len(bruters)} bruter job(s) in parallel" if bruters else ""))
+        items = [((c, t, s, ti, ci), i+1, total, self.results, self.timeout, cookie)
+                 for i, (c, t, s, ti, ci) in enumerate(cmds)]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fs: dict = {ex.submit(self._run_cmd, it): "cmd" for it in items}
+            fs |= {ex.submit(self._run_bruter, j, user_file): ("b", j["slug"]) for j in bruters}
+            for f in as_completed(fs):
+                tag = fs[f]
+                try:
+                    if tag == "cmd":
+                        idx, tool, log, rc, skipped = f.result()
+                        msg = (f"[!] Skip (not found): {tool}" if skipped
+                               else f"[*] Done [{idx}/{total}] {tool} -> {log}" + (f" (exit {rc})" if rc != 0 else ""))
+                    else:
+                        log, rc = f.result()
+                        msg = f"[*] Bruter [{tag[1]}] -> {log}" + (f" (exit {rc})" if rc != 0 else "")
+                    with self._lock: print(msg)
+                except Exception as e:
+                    with self._lock: print(f"[!] Error: {e}")
+
+    def _build(self, targets: list) -> tuple[list, list]:
+        cmds, bruters = [], []
+        for ti, t in enumerate(targets):
+            ep     = (t.get("endpoint") or "").strip()
+            slug   = _slug(ep)
+            bp     = t.get("body_params") or {}
+            params = list(bp.keys() if isinstance(bp, dict) else bp)
+            tok, csrf_f = _has_token(params)
+            for ci, cmd in enumerate(t.get("suggested_commands") or []):
+                cmd  = (cmd or "").strip()
+                if not cmd: continue
+                tool = _first_token(cmd)
+                if not tool: continue
+                if tool.lower() == "hydra" and tok and csrf_f:
+                    uf = next((p for p in params if p.lower() in ("username","user","uname","login")),
+                               params[0] if params else "username")
+                    pf = next((p for p in params if p.lower() in ("password","pass","pwd")), "password")
+                    bp_d   = bp if isinstance(bp, dict) else {p: "" for p in params}
+                    skip_k = {uf.lower(), pf.lower(), (csrf_f or "").lower()}
+                    extra  = "&".join(
+                        f"{p}={bp_d.get(p, '') or 'x'}"
+                        for p in params if p.lower() not in skip_k
+                    )
+                    bruters.append({
+                        "url": ep if "://" in ep else "", "endpoint": ep,
+                        "user_field": uf, "pass_field": pf, "csrf_field": csrf_f,
+                        "slug": slug, "ti": ti,
+                        "extra": extra,
+                        "form_params": bp_d,
+                    })
+                    continue
+                cmds.append((cmd, tool, slug, ti, ci))
+        return cmds, bruters
+
+    def _run_cmd(self, item) -> tuple:
+        (cmd, tool, slug, ti, ci), idx, total, results, timeout, cookie = item
+        if not _available(tool): return (idx, tool, "", -1, True)
+        if tool.lower() == "hydra":   cmd = self._fix_hydra(cmd)
+        if cookie:                     cmd = self._inject_cookie(cmd, tool, cookie)
+        if tool.lower() == "xsstrike" and "--skip" not in cmd: cmd += " --skip"
+        safe_tool = re.sub(r"[^\w-]", "_", tool)
+        log = f"{safe_tool}_{slug}_{ti}_{ci}.log"
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                               timeout=timeout, cwd=self.root)
+            (results / log).write_text(
+                f"# Command:\n{cmd}\n\n# Return code: {r.returncode}\n\n"
+                f"# --- stdout ---\n{r.stdout}\n# --- stderr ---\n{r.stderr or ''}",
+                encoding="utf-8")
+            return (idx, tool, log, r.returncode, False)
+        except subprocess.TimeoutExpired:
+            return (idx, tool, log, -1, False)
+        except Exception:
+            return (idx, tool, log, -1, False)
+
+    def _run_bruter(self, job: dict, user_file: str | None = None) -> tuple[str, int]:
+        url = job["url"] or (_scheme("127.0.0.1").rstrip("/") + "/" + job["endpoint"].lstrip("/"))
+        log = f"bruter_{job['slug']}_{job['ti']}.log"
+        pf  = str(self._pass) if self._pass.exists() else "/usr/share/wordlists/rockyou.txt"
+        cmd = [sys.executable, str(self.root / "modules" / "bruter.py"),
+               "--url", url, "--user-field", job["user_field"],
+               "--pass-field", job["pass_field"], "--csrf-field", job["csrf_field"],
+               "--pass-file", pf, "--failure-string", "incorrect|failed|login failed|invalid",
+               "--output", str(self.results / log)]
+        if job.get("extra"):                              cmd += ["--extra", job["extra"]]
+        if user_file and Path(user_file).exists():        cmd += ["--user-file", user_file]
+        log_path = self.results / log
+        try:
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write(f"# Command: {' '.join(cmd)}\n")
+                r = subprocess.run(cmd, cwd=self.root, timeout=self.timeout,
+                                   stdout=lf, stderr=lf)
+            return log, r.returncode
+        except Exception:
+            return log, -1
+
+    @staticmethod
+    def _fix_hydra(cmd: str) -> str:
+        m = re.search(r"(\s)(https?://[^/\s]+(?::\d+)?)(\s+http-post-form)", cmd)
+        if m:
+            u  = urlparse(m.group(2))
+            hp = (f"{u.hostname}:{u.port}" if u.port else
+                  f"{u.hostname}:443" if u.scheme == "https" else (u.hostname or ""))
+            return cmd.replace(m.group(0), m.group(1) + hp + m.group(3), 1)
+        return cmd
+
+    @staticmethod
+    def _inject_cookie(cmd: str, tool: str, cookie: str) -> str:
+        esc = cookie.replace('"', '\\"')
+        t   = tool.lower()
+
+        # ── Step 1: replace ALL placeholder patterns regardless of tool ─────
+        # covers: <YOUR_SESSION_COOKIE>  <YOUR_SESSION_COOKIES>
+        cmd = re.sub(r"<YOUR_SESSION_COOKIES?>", esc, cmd)
+        # covers quoted variants: '<SESSION_COOKIE>'  "<YOUR_SESSION_COOKIE>"
+        cmd = re.sub(r"""['"]\s*<[^>]*SESSION[^>]*>\s*['"]""", f'"{esc}"', cmd)
+
+        # ── Step 2: if no cookie flag present at all, append one ────────────
+        has_cookie = "--cookie" in cmd or "-b " in cmd or "--headers" in cmd
+        if has_cookie:
+            # sqlmap: ถ้าใช้ --forms หรือ --data ต้องบอกไม่ให้ test cookie param
+            # ไม่งั้นมัน modify PHPSESSID → session ตาย → redirect login
+            if t == "sqlmap" and "--level" in cmd and "--skip-waf" not in cmd:
+                if "--param-exclude" not in cmd:
+                    cmd = cmd.rstrip() + " --param-exclude=PHPSESSID"
+            return cmd
+
+        if t in ("sqlmap", "commix"):
+            extra = " --param-exclude=PHPSESSID" if t == "sqlmap" else ""
+            return cmd.rstrip() + f' --cookie="{esc}"{extra}'
+        if t == "xsstrike":
+            return cmd.rstrip() + f' --headers "Cookie: {esc}"'
+        if t == "curl":
+            return cmd.rstrip() + f' -b "{esc}"'
+        return cmd
+
+
+# ── ExploitPipeline ────────────────────────────────────────────────────
+class ExploitPipeline:
+    """5-phase full exploit: pre-auth → brute → login → post-auth → execute."""
+
+    def __init__(self, url: str, opts: argparse.Namespace):
+        self.url         = _scheme(url)
+        self.opts        = opts
+        self.root        = Path(__file__).resolve().parent
+        self.sess        = SessionManager(self.root)
+        self.runner      = CommandRunner(self.root, self.sess)
+        self.triage_eng  = TriageEngine(self.url)
+
+    def _cleanup_prev_scan(self) -> None:
+        """ลบไฟล์จากการ scan ครั้งก่อน ก่อนเริ่ม scan ใหม่"""
+        import shutil
+        to_delete = [
+            self.root / "active_session.json",
+            self.root / "triage.json",
+            self.root / "credentials.json",
+            self.root / "pre_auth_summary.md",
+            self.root / "final_report.md",
         ]
-        out = {
-            "url": login_url,
-            "Cookie": "; ".join(f"{c.name}={c.value}" for c in session.cookies),
-            "cookies": cookies_list,
-        }
-        Path(cookie_file).parent.mkdir(parents=True, exist_ok=True)
-        with open(cookie_file, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
+        for f in to_delete:
+            if f.exists():
+                f.unlink()
+                print(f"[*] Cleared: {f.name}")
+        results_dir = self.runner.results
+        if results_dir.exists():
+            shutil.rmtree(results_dir)
+            results_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[*] Cleared: results/")
+
+    def run(self) -> None:
+        self._cleanup_prev_scan()
+        self._phase("1/5  PRE-AUTH SCAN + TRIAGE", self._scan_pre)
+        login = self._find_login()
+
+        # ── ตัดสินว่าต้อง login ก่อนไหม ──────────────────────────────────
+        if login:
+            if self._is_site_gated():
+                # เจอแต่ login / สิ่งที่ต้อง auth → login อัตโนมัติ + ใช้ session ต่อ
+                print("[*] Site appears to be fully gated — proceeding with login.")
+                use_session = True
+            else:
+                # มีหน้า public ด้วย → ถามผู้ใช้
+                print("\n[?] Site has publicly accessible pages AND a login form.")
+                print("    [1] Scan public pages + brute force (credentials only, no post-auth scan)")
+                print("    [2] Login first, then scan authenticated pages")
+                choice = input("    Choose [1/2]: ").strip()
+                use_session = (choice == "2")
+
+            # brute force เสมอ ถ้ามี login form (ทั้ง choice 1 และ 2)
+            self._phase("2/5  BRUTE FORCE LOGIN", lambda: self._brute(login))
+            creds = self.sess.parse_creds(self.runner.results)
+
+            if use_session:
+                if not creds:
+                    print("[!] No credentials found. Stopping pipeline."); return
+                self._phase("3/5  AUTHENTICATE WITH FOUND CREDENTIALS", lambda: self._auth(login, creds))
+                if not self.sess.cookie_path.exists(): return
+                self._phase("4/5  POST-AUTH SCAN", self._scan_post)
+                self._phase("5/5  EXECUTE EXPLOITS (WITH SESSION)", self._execute)
+            else:
+                # choice [1]: มีรหัสแล้ว (ถ้าเจอ) แต่ scan public เท่านั้น
+                if creds:
+                    print(f"[*] Credentials found: {creds[0][0]}:{creds[0][1]} (saved to credentials.json)")
+                else:
+                    print("[*] No credentials found (brute force unsuccessful).")
+                print("[*] Scanning public pages only (no post-auth scan).")
+                self._phase("4/5  EXECUTE EXPLOITS (Pre-Auth)", self._execute)
+        else:
+            # ไม่มี login form เลย → scan ปกติ
+            self._phase("4/5  EXECUTE EXPLOITS (Pre-Auth)", self._execute)
+
+        print(f"\n{'='*60}\n[*] --run-exploit pipeline complete.")
+        print(f"[*] Triage       : {self.triage_eng.file}")
+        print(f"[*] Results      : {self.runner.results}/")
+        print(f"[*] Final report : {self.root / 'final_report.md'}\n{'='*60}")
+
+    def _is_site_gated(self) -> bool:
+        """คืน True ถ้า site ส่วนใหญ่ redirect ไป login (ไม่มีหน้า public จริงๆ).
+        ทดสอบโดย sample paths จาก triage — ถ้า >70% redirect ไป login → gated.
+        Register ไม่นับเป็น login form.
+        """
+        try:
+            td   = self.triage_eng.load()
+        except Exception:
+            return False
+        targets = [t.get("endpoint", "") for t in (td.get("targets") or [])
+                   if not any(x in (t.get("endpoint") or "").lower()
+                               for x in ("register", "signup", "newuser"))]
+        if not targets:
+            return False
+        login_keywords = ("login", "signin", "sign-in", "auth", "session")
+        login_count = 0
+        for ep in targets[:10]:  # sample แค่ 10 อัน
+            try:
+                r = requests.get(ep, timeout=5, allow_redirects=True)
+                if any(k in (r.url or "").lower() for k in login_keywords):
+                    login_count += 1
+            except Exception:
+                pass
+        ratio = login_count / min(len(targets), 10)
+        return ratio >= 0.7
+
+    def _phase(self, name, fn) -> None:
+        _hdr(f"PHASE {name}"); fn()
+
+    def _scan_pre(self) -> None:
+        r = ReconEngine(self.url)
+        r.run_paths()
+        r.print_paths()
+        # gobuster หลัง path_recon — ใช้ session เดียวกัน (re-login อัตโนมัติ)
+        self._run_gobuster_into(r)
+        r.run_payload(refresh=False)
+        r.print_forms()
+        t = self.triage_eng.local(r.forms, r.params)
+        self.triage_eng.save(t); self.triage_eng.show(t, "AUTO TRIAGE (Pre-Auth)")
+        Path("pre_auth_summary.md").write_text(
+            f"# Pre-Auth Scan\n- URL: {self.url}\n- Paths: {len(r.paths)}\n- Forms: {len(r.forms)}\n",
+            encoding="utf-8")
+
+    def _run_gobuster_into(self, r: ReconEngine) -> None:
+        """รัน gobuster หลัง path_recon แล้ว merge paths เข้า ReconEngine.
+        ถ้ามี session → refresh (re-login) ก่อนส่ง cookie ไปกับ gobuster
+        เพราะ Katana อาจทำให้ session หมดอายุก่อนหน้า.
+        """
+        from services.gobuster_service import run_gobuster_dir, parse_gobuster_output
+        wl = self.root / "SecLists/Discovery/Web-Content/common.txt"
+        if not wl.exists():
+            print("[*] Gobuster skipped (wordlist not found)", file=sys.stderr)
+            return
+
+        # ── refresh session ก่อน (เหมือน payload_recon) ──────────────────
+        hdrs: list[tuple] | None = None
+        if hasattr(self, "sess") and self.sess is not None:
+            fresh = self.sess.refresh()
+            hdrs  = fresh if fresh else self.sess.headers_list()
+            if fresh:
+                print("[*] Session refreshed before gobuster.")
+            else:
+                print("[*] Using existing session for gobuster.")
+
+        print(f"[*] Gobuster: {self.url}")
+        try:
+            out = run_gobuster_dir(
+                self.url, str(wl), threads=20, timeout_seconds=10,
+                status_codes="200,204,301,302,307,401,403", status_codes_blacklist="",
+                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=True,
+                random_agent=False, retry=False, retry_attempts=3, delay="0s",
+                no_error=False, no_progress=True, force=True, quiet=False,
+                on_output_line=lambda l: print(f"[gobuster] {l.strip()}") if "(Status:" in l else None,
+                extra_headers=hdrs)
+            base = self.url.rstrip("/") + "/"
+            seen = set(r.paths)
+            added = 0
+            for f in parse_gobuster_output(out):
+                full = urljoin(base, f.path.rstrip("/") or f.path)
+                if full not in seen:
+                    seen.add(full); r.paths.append(full); added += 1
+            print(f"[*] Gobuster added {added} new path(s) (total: {len(r.paths)})")
+        except Exception as e:
+            print(f"[!] Gobuster error: {e}", file=sys.stderr)
+
+    def _find_login(self) -> dict | None:
+        try:
+            td = self.triage_eng.load()
+        except Exception:
+            print("[!] No triage.json. Aborting pipeline."); return None
+        for t in (td.get("targets") or []):
+            bp   = t.get("body_params") or {}
+            keys = [k.lower() for k in (bp.keys() if isinstance(bp, dict) else bp)]
+            if (any(k in keys for k in ("username","user","uname","login")) and
+                    any(k in keys for k in ("password","pass","pwd"))):
+                return t
+        print("[!] No login form found in triage. Pre-auth scan complete (no login detected).")
+        return None
+
+    def _brute(self, login: dict) -> None:
+        bp     = login.get("body_params") or {}
+        bp_d   = bp if isinstance(bp, dict) else {k: "" for k in bp}
+        keys   = list(bp_d.keys())
+        uf     = next((k for k in keys if k.lower() in ("username","user","uname","login")), "username")
+        pf     = next((k for k in keys if k.lower() in ("password","pass","pwd")), "password")
+        cf     = next((k for k in keys if any(t in k.lower() for t in _TOK_KEYS)), None)
+        # fields ที่เหลือ (เช่น Login=Login, submit button) ต้องส่งไปด้วยไม่งั้น server บางตัวไม่ process
+        skip   = {(uf or "").lower(), (pf or "").lower(), (cf or "").lower()}
+        extra  = "&".join(
+            f"{k}={bp_d.get(k, 'x') or 'x'}"
+            for k in keys if k.lower() not in skip
+        )
+        ep     = (login.get("endpoint") or "").strip()
+        if "://" not in ep: ep = self.url.rstrip("/") + "/" + ep.lstrip("/")
+        pp     = self.root / "SecLists/Passwords/Common-Credentials/10k-most-common.txt"
+        log    = self.runner.results / "bruter_exploit_pipeline.log"
+        cmd    = [sys.executable, str(self.root / "modules" / "bruter.py"),
+                  "--url", ep, "--user-field", uf, "--pass-field", pf,
+                  "--pass-file", str(pp) if pp.exists() else "/usr/share/wordlists/rockyou.txt",
+                  "--failure-string", "incorrect|failed|login failed|invalid",
+                  "--output", str(log)]
+        if cf:    cmd += ["--csrf-field", cf]
+        if extra: cmd += ["--extra", extra]
+        if getattr(self.opts, "user_file", None) and Path(self.opts.user_file).exists():
+            cmd += ["--user-file", self.opts.user_file]
+        print(f"[*] Target  : {ep}")
+        print(f"[*] Fields  : user={uf}  pass={pf}" + (f"  csrf={cf}" if cf else ""))
+        if extra: print(f"[*] Extra   : {extra}")
+        subprocess.run(cmd, cwd=self.root)
+
+    def _auth(self, login: dict, creds: list) -> None:
+        bp     = login.get("body_params") or {}
+        bp_d   = bp if isinstance(bp, dict) else {k: "" for k in bp}
+        keys   = list(bp_d.keys())
+        cf     = next((k for k in keys if any(t in k.lower() for t in _TOK_KEYS)), None)
+        ep     = (login.get("endpoint") or "").strip()
+        if "://" not in ep: ep = self.url.rstrip("/") + "/" + ep.lstrip("/")
+        for user, pwd in creds[:3]:
+            if self.sess.login(ep, user, pwd, bp_d, cf or "user_token"):
+                self.sess.save_creds(ep, user, pwd, bp_d, cf or "user_token")
+                print(f"[*] Authenticated as {user}:****  →  active_session.json saved")
+                return
+        print("[!] Login failed with found credentials. Stopping pipeline.")
+        # clear cookie_path so pipeline aborts
+        if self.sess.cookie_path.exists():
+            self.sess.cookie_path.unlink(missing_ok=True)
+
+    def _scan_post(self) -> None:
+        r = ReconEngine(self.url, self.sess)
+        r.run_paths()
+        r.print_paths()
+        # gobuster หลัง Katana — re-login อัตโนมัติก่อนส่ง session cookie ไป
+        self._run_gobuster_into(r)
+        r.run_payload()
+        r.print_forms()
+        t2 = self.triage_eng.post_auth(r.paths, r.forms, r.params)
+        self.triage_eng.save(t2)
+        self.triage_eng.show(t2, "AI TRIAGE ROUND 2 (Post-Auth: IDOR, Access Control)")
+        self._write_report(t2, r.paths)
+
+    def _execute(self) -> None:
+        try:
+            triage = self.triage_eng.load()
+        except Exception as e:
+            print(f"[!] Cannot load triage: {e}"); return
+        self.runner.session = self.sess
+        self.runner.run(triage, min_confidence="medium", workers=getattr(self.opts, "workers", 4))
+
+    def _write_report(self, triage2: dict, paths: list) -> None:
+        pre_path = Path("pre_auth_summary.md")
+        pre_c    = pre_path.read_text(encoding="utf-8") if pre_path.exists() else "See results/ from pre-auth scan.\n"
+        targets  = triage2.get("targets") or []
+        lines    = ["## Post-Auth Scan", f"- URL: {self.url}", f"- Paths discovered: {len(paths)}",
+                    "", "### Triage Round 2 (IDOR / Access Control)", ""]
+        for t in targets:
+            if not isinstance(t, dict): continue
+            lines.append(f"- **{t.get('endpoint')}** [{t.get('method')}]")
+            lines.append(f"  - Suspected: {', '.join(t.get('suspected_issue_types') or [])}")
+            for c in (t.get("suggested_commands") or []):    lines.append(f"  - `$ {c}`")
+            for c in (t.get("recommended_manual_checks") or [])[:5]: lines.append(f"  - {c}")
+            lines.append("")
+        body = ("# OneClickScan V2 – Final Report\n\n## Pre-Auth\n\n"
+                + pre_c + "\n\n" + "\n".join(lines))
+        Path("final_report.md").write_text(body, encoding="utf-8")
+        print("[*] Report written: final_report.md")
 
 
-def _run_one(
-    item: tuple[tuple[str, str, str, int, int], int, int, Path, int, str | None],
-) -> tuple[int, str, str, int, bool]:
-    """
-    รันคำสั่งเดียวแล้วเขียน log.
-    item = ((cmd, tool, slug, ti, ci), idx, total, results_dir, timeout, cookie_header)
-    คืน (idx, tool, log_name, returncode, skipped)
-    """
-    (cmd, tool, slug, ti, ci), idx, total, results_dir, timeout, cookie_header = item
-    if not tool_available(tool):
-        return (idx, tool, "", -1, True)
-    if (tool or "").lower() == "hydra":
-        cmd = _normalize_hydra_command(cmd)
-    if cookie_header:
-        cmd = inject_cookie_into_command(cmd, tool, cookie_header)
-    safe_tool = re.sub(r"[^\w\-]", "_", tool)
-    log_name = f"{safe_tool}_{slug}_{ti}_{ci}.log"
-    log_path = results_dir / log_name
-    stdout, stderr, rc = run_command(cmd, timeout=timeout)
-    with open(log_path, "w", encoding="utf-8") as f:
-        f.write(f"# Command:\n{cmd}\n\n")
-        f.write(f"# Return code: {rc}\n\n")
-        f.write("# --- stdout ---\n")
-        f.write(stdout)
-        if stderr:
-            f.write("\n# --- stderr ---\n")
-            f.write(stderr)
-    return (idx, tool, log_name, rc, False)
+# ── ScanMode ───────────────────────────────────────────────────────────
+class ScanMode:
+    """Manual scan mode (recon + optional triage). Equivalent to old main.py."""
+
+    def __init__(self, url: str, opts: argparse.Namespace):
+        self.url        = _scheme(url)
+        self.opts       = opts
+        self.root       = Path(__file__).resolve().parent
+        cf              = getattr(opts, "cookie_file", None)
+        self.sess       = SessionManager(self.root, cf) if cf else None
+        self.recon      = ReconEngine(self.url, self.sess)
+        self.triage_eng = TriageEngine(self.url, getattr(opts, "ai_triage_output", "triage.json"))
+
+    def run(self) -> None:
+        o = self.opts
+        if o.path_recon or o.payload_recon:
+            self.recon.run_paths()
+            if o.path_recon: self.recon.print_paths()
+        if getattr(o, "gobuster",   False): self._gobuster()
+        if getattr(o, "nmap",       False): self._nmap()
+        if getattr(o, "whatweb",    False): self._whatweb()
+        if getattr(o, "subfinder",  False): self._subfinder()
+        if o.payload_recon:
+            self.recon.run_payload()
+            self.recon.print_forms()
+        if getattr(o, "auto_triage", False):
+            if self.recon.forms or self.recon.params:
+                t = self.triage_eng.local(self.recon.forms, self.recon.params)
+                self.triage_eng.save(t); self.triage_eng.show(t, "AUTO TRIAGE (Local – no Gemini)")
+            else:
+                print("[!] Auto triage skipped (no forms/params).", file=sys.stderr)
+        if getattr(o, "ai_triage", False):
+            if self.recon.paths:
+                try:
+                    t = self.triage_eng.ai(self.recon.paths, self.recon.forms, self.recon.params)
+                    self.triage_eng.save(t); self.triage_eng.show(t, "AI TRIAGE (Gemini)")
+                except Exception as e:
+                    print(f"[!] AI triage error: {e}", file=sys.stderr)
+            else:
+                print("[!] AI triage skipped (no paths).", file=sys.stderr)
+        if not getattr(o, "post_auth", False) and (self.recon.paths or self.recon.forms):
+            Path("pre_auth_summary.md").write_text(
+                f"# Pre-Auth Scan\n- URL: {self.url}\n- Paths: {len(self.recon.paths)}\n"
+                f"- Forms: {len(self.recon.forms)}\n- Query-only: {len(self.recon.params)}\n",
+                encoding="utf-8")
+        if getattr(o, "post_auth", False):
+            paths = list(set(self.recon.paths))
+            if paths or self.recon.forms:
+                t2 = self.triage_eng.post_auth(paths, self.recon.forms, self.recon.params)
+                self.triage_eng.save(t2)
+                self.triage_eng.show(t2, "AI TRIAGE ROUND 2 (Post-Auth: IDOR, Access Control)")
+                ExploitPipeline(self.url, o)._write_report(t2, paths)
+
+    def _gobuster(self) -> None:
+        from services.gobuster_service import run_gobuster_dir, parse_gobuster_output
+        wl   = str(self.root / "SecLists/Discovery/Web-Content/common.txt")
+        hdrs = self.sess.headers_list() if self.sess else None
+        print(f"[*] Gobuster started: url={self.url} threads=20 wordlist={wl}")
+        try:
+            out = run_gobuster_dir(
+                self.url, wl, threads=20, timeout_seconds=10,
+                status_codes="200,204,301,302,307,401,403", status_codes_blacklist="",
+                extensions=None, user_agent=_UA, follow_redirect=False, insecure_tls=True,
+                random_agent=False, retry=False, retry_attempts=3, delay="0s",
+                no_error=False, no_progress=True, force=True, quiet=False,
+                on_output_line=lambda l: print(f"[gobuster] {l.strip()}") if "(Status:" in l else None,
+                extra_headers=hdrs)
+            _hdr("GOBUSTER DIR (Hidden paths)")
+            findings = parse_gobuster_output(out)
+            base = self.url.rstrip("/") + "/"
+            seen: set[str] = set()
+            shown: list[str] = []
+            for f in findings:
+                full = urljoin(base, f.path.rstrip("/") or f.path)
+                if full not in seen: seen.add(full); shown.append(full)
+            print(f"Total findings: {len(shown)}")
+            for u in shown[:100]: print(f"  {u}")
+            if len(shown) > 100: print(f"  ... and {len(shown)-100} more")
+            self.recon.paths.extend(shown)
+        except Exception as e:
+            print(f"[!] Gobuster error: {e}", file=sys.stderr)
+
+    def _nmap(self) -> None:
+        from services.nmap_service import run_nmap_scan, parse_nmap_services, get_cve_info
+        host = urlparse(self.url).netloc or self.url
+        try:
+            out = run_nmap_scan(host, getattr(self.opts, "nmap_ports", 20))
+            _hdr("NMAP SERVICE SCAN"); print(out)
+            for p, svc, ver in parse_nmap_services(out):
+                print(f"[+] Service: {p} | {ver}")
+                print(f"    [>] CVE/Exploit: {get_cve_info(svc, ver)}")
+        except Exception as e:
+            print(f"[!] Nmap error: {e}", file=sys.stderr)
+
+    def _whatweb(self) -> None:
+        from services.whatweb_service import (run_whatweb, parse_whatweb_output,
+                                               filter_versioned_findings, exploit_db_search_link)
+        from services.cve_service import search_cves_by_query
+        try:
+            out = run_whatweb(self.url)
+            _hdr("WHATWEB FINGERPRINT"); print(out.strip())
+            seen: set[str] = set()
+            for f in filter_versioned_findings(parse_whatweb_output(out)):
+                key = f"{f.product.lower()} {f.version}"
+                if key in seen or not f.version: continue
+                seen.add(key)
+                print(f"[+] {f.product} {f.version} (from {f.plugin}[{f.value}])")
+                print(f"    [>] Check Exploits: {exploit_db_search_link(f.query)}")
+                if getattr(self.opts, "whatweb_cve", False):
+                    for c in search_cves_by_query(f.query, limit=getattr(self.opts, "whatweb_cve_limit", 5)):
+                        print(f"    [CVE] {c.cve} - {c.summary[:120]}")
+        except Exception as e:
+            print(f"[!] WhatWeb error: {e}", file=sys.stderr)
+
+    def _subfinder(self) -> None:
+        from services.subfinder_service import get_root_domain, run_subfinder
+        from services.httpx_service import run_httpx
+        root = get_root_domain(self.url)
+        if not root: return
+        scheme = urlparse(self.url).scheme or "http"
+        try:
+            subs  = run_subfinder(root)
+            alive = run_httpx([f"{scheme}://{s}" for s in subs]) if subs else []
+            _hdr("SUBFINDER (Subdomains)")
+            print(f"Root domain: {root}")
+            print(f"Total found: {len(subs)}  |  Alive (httpx): {len(alive)}")
+            for u in alive[:200]: print(f"  {u}")
+            if len(alive) > 200: print(f"  ... and {len(alive)-200} more")
+        except Exception as e:
+            print(f"[!] Subfinder error: {e}", file=sys.stderr)
 
 
+# ── ExecMode ───────────────────────────────────────────────────────────
+class ExecMode:
+    """Run commands from existing triage.json + optional post-exploit loop."""
+
+    def __init__(self, triage_file: str, opts: argparse.Namespace):
+        self.root        = Path(__file__).resolve().parent
+        self.triage_file = triage_file
+        self.opts        = opts
+        cf               = getattr(opts, "cookie_file", None)
+        self.sess        = SessionManager(self.root, cf) if cf else None
+        self.runner      = CommandRunner(
+            self.root, self.sess,
+            results_dir=getattr(opts, "results_dir", "results"),
+            timeout=getattr(opts, "timeout", 300))
+
+    def run(self) -> None:
+        try:
+            triage = TriageEngine("", self.triage_file).load()
+        except FileNotFoundError as e:
+            print(f"[!] {e}", file=sys.stderr); sys.exit(1)
+        mc = (getattr(self.opts, "min_confidence", None)
+              or ("high" if getattr(self.opts, "high_only", False) else None))
+        self.runner.run(triage, min_confidence=mc,
+                        workers=max(1, getattr(self.opts, "workers", 4)),
+                        dry_run=getattr(self.opts, "dry_run", False),
+                        user_file=getattr(self.opts, "user_file", None))
+        if not getattr(self.opts, "dry_run", False) and not getattr(self.opts, "no_rescan_prompt", False):
+            self._post_exploit(triage)
+        print("[*] Done.")
+
+    def _post_exploit(self, triage: dict) -> None:
+        sess  = self.sess or SessionManager(self.root)
+        creds = sess.parse_creds(self.runner.results)
+        if not creds: return
+        lt = next((t for t in (triage.get("targets") or [])
+                   if any(k in [str(x).lower() for x in (t.get("body_params") or {}).keys()]
+                          for k in ("username","user","uname","login"))
+                   and any(k in [str(x).lower() for x in (t.get("body_params") or {}).keys()]
+                           for k in ("password","pass","pwd"))), None)
+        if not lt: return
+        ep   = (lt.get("endpoint") or "").strip()
+        bp   = lt.get("body_params") or {}
+        bp_d = bp if isinstance(bp, dict) else {k: "" for k in bp}
+        keys = list(bp_d.keys())
+        cf   = next((k for k in keys if any(t in k.lower() for t in _TOK_KEYS)), "user_token")
+        base = (f"{urlparse(ep).scheme}://{urlparse(ep).netloc}/" if "://" in ep
+                else (triage.get("base_url") or "").rstrip("/") + "/")
+        new_sess = SessionManager(self.root)
+        logged = False
+        for user, pwd in creds[:3]:
+            if new_sess.login(ep, user, pwd, bp_d, cf):
+                new_sess.save_creds(ep, user, pwd, bp_d, cf)
+                print(f"[*] Post-exploit login OK: {user}:**** -> {new_sess.cookie_path}")
+                logged = True; break
+        if not logged or not new_sess.cookie_path.exists(): return
+        try:
+            print("\n[*] ต้องการเริ่ม High-Level Scan ในฐานะ User หรือไม่? (Y/N): ", end="")
+            if input().strip().upper() != "Y": return
+            cmd = [sys.executable, str(Path(__file__)), "scan",
+                   "-u", base.rstrip("/"),
+                   "--path-recon", "--payload-recon",
+                   "--cookie-file", str(new_sess.cookie_path), "--post-auth"]
+            while True:
+                print(f"[*] Running: {' '.join(cmd)}")
+                subprocess.run(cmd, cwd=self.root)
+                print("\n[*] ต้องการสแกนต่ออีกหรือไม่? (Y/N): ", end="")
+                if input().strip().upper() != "Y": break
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+# ── CLI ────────────────────────────────────────────────────────────────
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run suggested commands from triage.json (AI/auto triage output)"
+        prog="executor.py",
+        description="OneClickScan V2 — web pentest tool",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python executor.py -u http://target --path-recon --payload-recon --auto-triage\n"
+            "  python executor.py -u http://target --all\n"
+            "  python executor.py -u http://target --run-exploit\n"
+            "  python executor.py --min-confidence medium --workers 6\n"
+            "  python executor.py triage.json --min-confidence medium\n"
+        ),
     )
-    parser.add_argument(
-        "triage_file",
-        nargs="?",
-        default="triage.json",
-        help="Path to triage.json (default: triage.json)",
-    )
-    parser.add_argument(
-        "--high-only",
-        action="store_true",
-        help="Run only targets with confidence 'high' (same as --min-confidence high)",
-    )
-    parser.add_argument(
-        "--min-confidence",
-        choices=["high", "medium", "low"],
-        metavar="LEVEL",
-        help="Minimum confidence: high=only high, medium=high+medium, low=all (default: all)",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Run all targets (no filter)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Only print commands and missing tools, do not execute",
-    )
-    parser.add_argument(
-        "--results-dir",
-        default="results",
-        metavar="DIR",
-        help="Directory for output logs (default: results)",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=300,
-        metavar="SEC",
-        help="Timeout per command in seconds (default: 300)",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        metavar="N",
-        help="Number of commands to run in parallel (default: 4)",
-    )
-    parser.add_argument(
-        "--cookie-file",
-        default=None,
-        metavar="FILE",
-        help="Inject session from FILE (e.g. active_session.json) into sqlmap/xsstrike",
-    )
-    parser.add_argument(
-        "--no-rescan-prompt",
-        action="store_true",
-        help="Do not prompt for High-Level Scan after run (skip Y/N)",
-    )
-    parser.add_argument(
-        "--user-file",
-        default=None,
-        metavar="FILE",
-        help="Username list for bruter (when form has token). Default: admin",
-    )
-    parser.add_argument(
-        "--pass-file",
-        default=None,
-        metavar="FILE",
-        help="Password list for bruter/hydra. Default: SecLists/.../10k-most-common.txt",
-    )
+    # ── target ──
+    parser.add_argument("positional",       nargs="?", default=None,
+                        metavar="URL_or_FILE",
+                        help="Target URL (scan/exploit) or triage.json path (exec)")
+    parser.add_argument("-u", "--url",      dest="url", metavar="URL",
+                        help="Target URL (alternative to positional)")
+    # ── scan flags ──
+    parser.add_argument("--path-recon",     action="store_true", help="Katana path crawl")
+    parser.add_argument("--payload-recon",  action="store_true", help="Form + param extraction")
+    parser.add_argument("--auto-triage",    action="store_true", help="Local heuristic triage (no Gemini)")
+    parser.add_argument("--ai-triage",      action="store_true", help="Gemini AI triage")
+    parser.add_argument("--ai-triage-output", default="triage.json", metavar="FILE")
+    parser.add_argument("--nmap",           action="store_true")
+    parser.add_argument("--nmap-ports",     type=int, default=20, metavar="N")
+    parser.add_argument("--whatweb",        action="store_true")
+    parser.add_argument("--whatweb-cve",    action="store_true")
+    parser.add_argument("--whatweb-cve-limit", type=int, default=5, metavar="N")
+    parser.add_argument("--gobuster",       action="store_true")
+    parser.add_argument("--subfinder",      action="store_true")
+    parser.add_argument("--all",            action="store_true",
+                        help="Enable path-recon + payload-recon + nmap + whatweb + gobuster + subfinder")
+    parser.add_argument("--cookie-file",    default=None, metavar="FILE",
+                        help="Session cookie file (active_session.json)")
+    parser.add_argument("--post-auth",      action="store_true",
+                        help="Post-auth mode: AI triage round-2 + final_report.md")
+    parser.add_argument("--run-exploit",    action="store_true",
+                        help="Full pipeline: scan → brute force → post-auth → exploit")
+    # ── exec flags ──
+    parser.add_argument("--high-only",      action="store_true")
+    parser.add_argument("--min-confidence", choices=["high","medium","low"], metavar="LEVEL")
+    parser.add_argument("--dry-run",        action="store_true")
+    parser.add_argument("--results-dir",    default="results", metavar="DIR")
+    parser.add_argument("--timeout",        type=int, default=300, metavar="SEC")
+    parser.add_argument("--workers",        type=int, default=4,   metavar="N")
+    parser.add_argument("--no-rescan-prompt", action="store_true")
+    parser.add_argument("--user-file",      default=None, metavar="FILE")
+    parser.add_argument("--pass-file",      default=None, metavar="FILE")
+
     args = parser.parse_args()
 
-    min_confidence: str | None = getattr(args, "min_confidence", None)
-    if args.high_only:
-        min_confidence = "high"
-    if args.all:
-        min_confidence = None  # all
+    # ── resolve URL vs triage file ──
+    url        = args.url or (args.positional if args.positional and not args.positional.endswith(".json") else None)
+    triage_file = (args.positional if args.positional and args.positional.endswith(".json")
+                   else "triage.json")
 
-    try:
-        data = load_triage(args.triage_file)
-    except FileNotFoundError as e:
-        print(f"[!] {e}", file=sys.stderr)
-        sys.exit(1)
+    _scan_flags = (args.path_recon or args.payload_recon or args.nmap or args.whatweb
+                   or args.gobuster or args.subfinder or args.auto_triage or args.ai_triage
+                   or args.post_auth or args.all or args.run_exploit)
 
-    targets = data.get("targets") or []
-    if not targets:
-        print("[!] No targets in triage file.", file=sys.stderr)
-        sys.exit(1)
+    # ── dispatch ──
+    if args.run_exploit:
+        if not url: parser.error("--run-exploit requires -u URL")
+        ExploitPipeline(url, args).run()
 
-    filtered = filter_targets(targets, min_confidence)
-    if not filtered:
-        print(
-            "[!] No targets match filter (--min-confidence/--high-only too strict for this triage).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    elif url and _scan_flags:
+        if args.all:
+            args.path_recon = args.payload_recon = True
+            args.nmap = args.whatweb = args.gobuster = args.subfinder = True
+        if args.ai_triage or args.auto_triage:
+            args.payload_recon = True
+        ScanMode(url, args).run()
 
-    project_root = Path(__file__).resolve().parent
-    pass_file_opt = getattr(args, "pass_file", None)
-    default_pass_file = Path(pass_file_opt) if pass_file_opt else None
-    if not default_pass_file or not default_pass_file.exists():
-        default_pass_file = project_root / "SecLists" / "Passwords" / "Common-Credentials" / "10k-most-common.txt"
-    if not default_pass_file.exists():
-        default_pass_file = Path("/usr/share/wordlists/rockyou.txt")
-
-    # รวบรวมคำสั่งทั้งหมด + bruter_jobs (เมื่อพบ token ใน form ให้ใช้ bruter แทน hydra)
-    commands: list[tuple[str, str, str, int, int]] = []  # (cmd, tool, slug, target_idx, cmd_idx)
-    bruter_jobs: list[dict] = []  # [{url, user_field, pass_field, csrf_field, extra, slug, ti, form_params}]
-    for ti, t in enumerate(filtered):
-        endpoint = (t.get("endpoint") or "").strip()
-        slug = endpoint_to_slug(endpoint)
-        body_params = t.get("body_params")
-        if isinstance(body_params, list):
-            param_names = [str(x) for x in body_params]
-        else:
-            param_names = list((body_params or {}).keys())
-        has_token, csrf_field = has_token_like_param(param_names)
-
-        for ci, cmd in enumerate(t.get("suggested_commands") or []):
-            cmd = (cmd or "").strip()
-            if not cmd:
-                continue
-            tool = extract_tool_name(cmd)
-            if not tool:
-                continue
-            if (tool or "").lower() == "hydra" and has_token and csrf_field:
-                # Override: ไม่รัน hydra ให้รัน bruter แทน
-                user_field = next((p for p in param_names if str(p).lower() in ("username", "user", "uname", "login")), param_names[0] if param_names else "username")
-                pass_field = next((p for p in param_names if str(p).lower() in ("password", "pass", "pwd")), "password")
-                extra_parts = [f"{p}=x" for p in param_names if str(p).lower() not in (user_field.lower(), pass_field.lower(), csrf_field.lower())]
-                bruter_jobs.append({
-                    "url": endpoint if "://" in endpoint else "",
-                    "endpoint": endpoint,
-                    "user_field": user_field,
-                    "pass_field": pass_field,
-                    "csrf_field": csrf_field,
-                    "extra": "&".join(extra_parts),
-                    "slug": slug,
-                    "ti": ti,
-                    "form_params": {p: "" for p in param_names},
-                })
-                continue
-            commands.append((cmd, tool, slug, ti, ci))
-
-    # Safety: ตรวจสอบ tools ที่จะใช้
-    tools_used = {t for (_, t, _, _, _) in commands}
-    missing = [t for t in sorted(tools_used) if not tool_available(t)]
-    if missing:
-        print("[!] Missing tools (install or add to PATH):", ", ".join(missing), file=sys.stderr)
-        if not args.dry_run:
-            print("[?] Continue anyway? [y/N]: ", end="", file=sys.stderr)
-            try:
-                if input().strip().lower() != "y":
-                    sys.exit(1)
-            except (EOFError, KeyboardInterrupt):
-                sys.exit(1)
-
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[*] Output directory: {results_dir.resolve()}")
-
-    if min_confidence == "high":
-        print("[*] Mode: min-confidence high only")
-    elif min_confidence == "medium":
-        print("[*] Mode: min-confidence high + medium")
     else:
-        print("[*] Mode: all targets")
-
-    cookie_header: str | None = None
-    if getattr(args, "cookie_file", None):
-        cookie_header = load_cookie_header(args.cookie_file)
-        if cookie_header:
-            print(f"[*] Cookie file loaded: {args.cookie_file}")
-        else:
-            cookie_header = None
-
-    workers = max(1, args.workers)
-    print(f"[*] Commands to run: {len(commands)} (workers: {workers})")
-    if bruter_jobs:
-        print(f"[*] Bruter jobs (form with token): {len(bruter_jobs)} (override hydra)")
-    if args.dry_run:
-        for cmd, tool, slug, ti, ci in commands:
-            print(f"  {tool}: {cmd[:80]}{'...' if len(cmd) > 80 else ''}")
-        for job in bruter_jobs:
-            print(f"  bruter: {job['url'][:60]}... (csrf={job['csrf_field']})")
-        print("[*] Dry run — no execution.")
-        return
-
-    total = len(commands)
-    items = [
-        ((cmd, tool, slug, ti, ci), idx + 1, total, results_dir, args.timeout, cookie_header)
-        for idx, (cmd, tool, slug, ti, ci) in enumerate(commands)
-    ]
-    print_lock = threading.Lock()
-
-    def _log(msg: str) -> None:
-        with print_lock:
-            print(msg)
-
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_run_one, it): it for it in items}
-        for future in as_completed(futures):
-            try:
-                idx, tool, log_name, rc, skipped = future.result()
-                if skipped:
-                    _log(f"[!] Skip (not found): {tool}")
-                else:
-                    _log(f"[*] Done [{idx}/{total}] {tool} -> {log_name}" + (f" (exit {rc})" if rc != 0 else ""))
-            except Exception as e:
-                _log(f"[!] Error: {e}")
-
-    # รัน bruter สำหรับ form ที่มี token (แทน hydra)
-    base_url_bruter = ""
-    for t in filtered:
-        ep = (t.get("endpoint") or "").strip()
-        if "://" in ep:
-            base_url_bruter = f"{urlparse(ep).scheme}://{urlparse(ep).netloc}/"
-            break
-    for job in bruter_jobs:
-        url = job["url"]
-        if not url or "://" not in url:
-            url = (base_url_bruter or "http://127.0.0.1/").rstrip("/") + "/" + (job.get("endpoint") or "").lstrip("/")
-        log_name = f"bruter_{job['slug']}_{job['ti']}.log"
-        log_path = results_dir / log_name
-        pass_file = str(default_pass_file) if default_pass_file.exists() else "/usr/share/wordlists/rockyou.txt"
-        bruter_cmd = [
-            sys.executable,
-            str(project_root / "bruter.py"),
-            "--url", url,
-            "--user-field", job["user_field"],
-            "--pass-field", job["pass_field"],
-            "--csrf-field", job["csrf_field"],
-            "--pass-file", pass_file,
-            "--failure-string", "incorrect|failed|login failed|invalid",
-            "--output", str(log_path),
-        ]
-        if job.get("extra"):
-            bruter_cmd.extend(["--extra", job["extra"]])
-        if getattr(args, "user_file", None) and Path(args.user_file).exists():
-            bruter_cmd.extend(["--user-file", str(args.user_file)])
-        try:
-            proc = subprocess.run(
-                bruter_cmd,
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=args.timeout,
-            )
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"# Command: {' '.join(bruter_cmd)}\n")
-                f.write(f"# Return code: {proc.returncode}\n# --- stdout ---\n")
-                f.write(proc.stdout or "")
-                if proc.stderr:
-                    f.write("\n# --- stderr ---\n" + proc.stderr)
-            _log(f"[*] Bruter [{job['slug']}] -> {log_name}" + (f" (exit {proc.returncode})" if proc.returncode != 0 else ""))
-        except Exception as e:
-            _log(f"[!] Bruter error: {e}")
-
-    # Post-Exploit: สแกน log หา credential (hydra + bruter) แล้ว login จริง, บันทึก session, ถามรัน High-Level Scan
-    session_saved = False
-    base_url_for_rescan: str | None = None
-    if not args.dry_run and not getattr(args, "no_rescan_prompt", False):
-        all_logs = list(Path(args.results_dir).glob("*.log"))
-        credentials: list[tuple[str, str]] = []
-        for log_path in all_logs:
-            credentials.extend(parse_credentials_from_log(log_path))
-        if credentials:
-            # หา login endpoint จาก triage (target ที่มี uname/username + pass/password)
-            login_target = None
-            for t in filtered:
-                bp = (t.get("body_params") or []) if isinstance(t.get("body_params"), list) else list((t.get("body_params") or {}).keys())
-                bp_lower = [str(x).lower() for x in bp]
-                if any(x in bp_lower for x in ("username", "user", "uname", "login")) and any(x in bp_lower for x in ("password", "pass", "pwd")):
-                    login_target = t
-                    break
-            if login_target:
-                endpoint = (login_target.get("endpoint") or "").strip()
-                if endpoint and "://" in endpoint:
-                    base_url_for_rescan = f"{urlparse(endpoint).scheme}://{urlparse(endpoint).netloc}/"
-                else:
-                    base_url_for_rescan = (data.get("base_url") or "").rstrip("/") + "/"
-                login_url = endpoint if (endpoint and "://" in endpoint) else (base_url_for_rescan or "").rstrip("/") + "/" + endpoint.lstrip("/")
-                form_params = {}
-                if isinstance(login_target.get("body_params"), list):
-                    for k in login_target["body_params"]:
-                        form_params[str(k)] = ""
-                else:
-                    form_params = dict(login_target.get("body_params") or {})
-                for user, passwd in credentials[:3]:  # ลองสูงสุด 3 ชุด
-                    cookie_path = Path(args.results_dir).parent / "active_session.json"
-                    if post_exploit_login(
-                        login_url=login_url,
-                        username=user,
-                        password=passwd,
-                        form_body_params=form_params,
-                        cookie_file=cookie_path,
-                        csrf_token_name="user_token",
-                    ):
-                        session_saved = True
-                        print(f"[*] Post-exploit login OK: {user}:**** -> {cookie_path}")
-                        break
-                if not session_saved and credentials:
-                    print("[*] No successful login (try manual or check CSRF).")
-        if session_saved and base_url_for_rescan:
-            base_url_for_rescan = base_url_for_rescan.rstrip("/") + "/"
-            try:
-                print("\n[*] ต้องการเริ่ม High-Level Scan ในฐานะ User หรือไม่? (Y/N): ", end="")
-                ans = input().strip().upper()
-                if ans != "Y":
-                    _print_post_scan_summary(Path(__file__).resolve().parent)
-                elif ans == "Y":
-                    cookie_path = (Path(args.results_dir).parent / "active_session.json").resolve()
-                    cmd_main = [
-                        sys.executable,
-                        str(Path(__file__).resolve().parent / "main.py"),
-                        "-u", base_url_for_rescan.rstrip("/"),
-                        "--path-recon", "--payload-recon",
-                        "--cookie-file", str(cookie_path),
-                        "--post-auth",
-                    ]
-                    while True:
-                        print(f"[*] Running: {' '.join(cmd_main)}")
-                        subprocess.run(cmd_main, cwd=Path(__file__).resolve().parent)
-                        try:
-                            print("\n[*] ต้องการสแกนต่ออีกหรือไม่? (Y/N): ", end="")
-                            if input().strip().upper() != "Y":
-                                _print_post_scan_summary(Path(__file__).resolve().parent)
-                                break
-                            continue
-                        except (EOFError, KeyboardInterrupt):
-                            _print_post_scan_summary(Path(__file__).resolve().parent)
-                            break
-            except (EOFError, KeyboardInterrupt):
-                pass
-
-    print("[*] Done.")
+        # exec mode: run commands from triage.json
+        if args.high_only:
+            args.min_confidence = "high"
+        if args.all:
+            args.min_confidence = None
+        ExecMode(triage_file, args).run()
 
 
 if __name__ == "__main__":

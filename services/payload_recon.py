@@ -5,12 +5,14 @@ Payload Recon Service - ดึง Forms และ URL params จาก URLs
 และรองรับหน้า SPA/hash routes ผ่าน browser-rendered DOM
 """
 import re
+import warnings
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from urllib.parse import urljoin, urlparse, parse_qs
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional
+
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 
 def extract_url_params(url: str) -> Optional[Dict[str, str]]:
@@ -22,14 +24,15 @@ def extract_url_params(url: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def _infer_field_name(tag: Any, index: int) -> str:
+def _infer_field_name(tag: Any, index: int) -> Optional[str]:
+    """คืนชื่อ field จาก name/formcontrolname/id/placeholder/aria-label ถ้าไม่มีเลยคืน None (ข้าม)"""
     for attr in ("name", "formcontrolname", "id", "placeholder", "aria-label"):
         value = tag.get(attr)
         if value:
             cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value).strip()).strip("_")
             if cleaned:
                 return cleaned
-    return f"field_{index}"
+    return None
 
 
 def _extract_forms_from_html(source_url: str, html: str) -> List[Dict[str, Any]]:
@@ -48,6 +51,8 @@ def _extract_forms_from_html(source_url: str, html: str) -> List[Dict[str, Any]]
         body_params: Dict[str, str] = {}
         for idx, ipt in enumerate(form.find_all(["input", "textarea", "select"])):
             name = _infer_field_name(ipt, idx)
+            if name is None:
+                continue
             body_params[name] = ipt.get("value") or ""
         mapped_data.append(
             {
@@ -68,6 +73,8 @@ def _extract_forms_from_html(source_url: str, html: str) -> List[Dict[str, Any]]
         body_params: Dict[str, str] = {}
         for idx, ipt in enumerate(inputs):
             name = _infer_field_name(ipt, idx)
+            if name is None:
+                continue
             body_params[name] = ipt.get("value") or ""
         parsed_url = urlparse(request_url)
         query_params = {k: v[0] for k, v in parse_qs(parsed_url.query).items()}
@@ -167,7 +174,7 @@ def run_payload_recon(
     รับ list ของ paths (จาก Katana) แล้วจัดกลุ่มเป็น:
     - grouped_forms: HTML forms (method|action|params)
     - url_entry_points: URL ที่มี query params แต่ไม่มี form
-    ใช้ multithread เรียก map_forms แยกต่อ path
+    รันทีละ path (ไม่ใช้ multithread) เพื่อไม่ให้ session หลุด
     """
     grouped_forms: Dict[str, Any] = {}
     url_entry_points: Dict[str, Any] = {}
@@ -180,30 +187,28 @@ def run_payload_recon(
     if extra_headers:
         shared_session.headers.update(extra_headers)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {executor.submit(_process_one_path, p, extra_headers, shared_session): p for p in paths}
-        for future in as_completed(future_to_path):
-            try:
-                path, forms_found, u_params = future.result()
-            except Exception:
-                continue
-            # 1. HTML Forms
-            for f in forms_found:
-                q_keys = sorted((f.get("query_params") or {}).keys())
-                b_keys = sorted((f.get("body_params") or {}).keys())
-                sig = f"{f['method']}|{f['target_action']}|Q{q_keys}|B{b_keys}"
-                if sig not in grouped_forms:
-                    grouped_forms[sig] = {"details": f, "paths": set()}
-                grouped_forms[sig]["paths"].add(path)
-            # 2. URL params (inferred)
-            if u_params:
-                base_path = path.split("?")[0]
-                if base_path not in inferred_by_base:
-                    inferred_by_base[base_path] = {"params": {}, "example_urls": set()}
-                # merge params (ไม่ overwrite ถ้ามี key ซ้ำ)
-                for k, v in u_params.items():
-                    inferred_by_base[base_path]["params"].setdefault(k, v)
-                inferred_by_base[base_path]["example_urls"].add(path)
+    for path in paths:
+        try:
+            path, forms_found, u_params = _process_one_path(path, extra_headers, shared_session)
+        except Exception:
+            continue
+        # 1. HTML Forms
+        for f in forms_found:
+            q_keys = sorted((f.get("query_params") or {}).keys())
+            b_keys = sorted((f.get("body_params") or {}).keys())
+            sig = f"{f['method']}|{f['target_action']}|Q{q_keys}|B{b_keys}"
+            if sig not in grouped_forms:
+                grouped_forms[sig] = {"details": f, "paths": set()}
+            grouped_forms[sig]["paths"].add(path)
+        # 2. URL params (inferred)
+        if u_params:
+            base_path = path.split("?")[0]
+            if base_path not in inferred_by_base:
+                inferred_by_base[base_path] = {"params": {}, "example_urls": set()}
+            # merge params (ไม่ overwrite ถ้ามี key ซ้ำ)
+            for k, v in u_params.items():
+                inferred_by_base[base_path]["params"].setdefault(k, v)
+            inferred_by_base[base_path]["example_urls"].add(path)
 
     # 3) Combine: ถ้า base_path เดียวกันมีทั้ง form และ inferred query ให้รวมเข้า form แล้วลบออกจาก query-only list
     used_bases: set[str] = set()

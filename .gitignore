@@ -22,9 +22,11 @@ build/
 active_session.json
 triage.json
 triage_round2.json
+credentials.json
 pre_auth_summary.md
 final_report.md
-results/
+results/*
+!results/.gitkeep
 
 # Wordlists (large, install separately)
 SecLists/
@@ -45,6 +47,14 @@ Thumbs.db
 *.tmp
 .cache/
 
+# Tool state files
+hydra.restore
+hydra.restore.*
+*.restore
+sqlmap/
+/tmp/
+.sqlmap/
+
 # Playwright
 playwright-report/
 test-results/
@@ -53,3 +63,7 @@ test-results/
 # Misc
 .output/
 *.bak
+*.orig
+
+# bruter.py (old location — moved to modules/bruter.py)
+/bruter.py

@@ -98,7 +98,7 @@ def run_local_triage(
             if "xss" not in suspected:
                 suspected.append("xss")
             full_for_tool = urljoin(base, action or "")
-            commands.append(f'xsstrike -u "{full_for_tool}" --data "{data_str}"')
+            commands.append(f'xsstrike -u "{full_for_tool}" --data "{data_str}" --skip')
 
         # Commix สำหรับจุดที่อาจมี command injection
         if any("cmd" in k.lower() or "command" in k.lower() or "exec" in k.lower() for k in (body_keys + query_keys)):
@@ -141,7 +141,7 @@ def run_local_triage(
             "recommended_manual_checks": [],
             "suggested_commands": [
                 f'sqlmap -u "{full_url}" --batch',
-                f'xsstrike -u "{full_url}"',
+                f'xsstrike -u "{full_url}" --skip',
             ],
         })
 
