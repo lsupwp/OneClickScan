@@ -18,10 +18,17 @@ playwright install chromium   # สำหรับ SPA crawling
 
 ### External tools (Ubuntu/Debian)
 ```bash
-bash install_tools.sh
+chmod +x install_tools.sh
+./install_tools.sh
 ```
 
-tools ที่ใช้: `katana`, `nmap`, `whatweb`, `gobuster`, `subfinder`, `httpx`, `sqlmap`, `xsstrike`, `hydra`, `commix`
+จะติดตั้ง: **katana**, **nmap**, **whatweb**, **gobuster**, **subfinder**, **httpx**, **sqlmap**, **xsstrike**, **hydra**, **commix**
+
+- จาก apt: `nmap`, `whatweb`, `gobuster`, `hydra`
+- จาก Go: `katana`, `subfinder`, `httpx` (ใน `$GOPATH/bin`)
+- จาก git + symlink ใน `~/.local/bin`: `sqlmap`, `xsstrike`, `commix` (โฟลเดอร์เก็บที่ `$HOME/tools` หรือกำหนด `INSTALL_DIR=/path/to/tools ./install_tools.sh`)
+
+หลังติดตั้ง: รัน `source ~/.bashrc` หรือเปิด terminal ใหม่
 
 ### API Key (สำหรับ --ai-triage)
 ```bash

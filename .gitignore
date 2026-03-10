@@ -1,14 +1,22 @@
 # Environment & secrets
 .env
+.env.*
+!.env.example
 *.env
 
 # Python
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
 *.pyd
 .Python
+*.egg-info/
+.eggs/
+dist/
+build/
 
 # Scan outputs (sensitive - contain target data)
 active_session.json
@@ -21,6 +29,27 @@ results/
 # Wordlists (large, install separately)
 SecLists/
 
-# Misc
-*.log
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+*.tmp
+.cache/
+
+# Playwright
+playwright-report/
+test-results/
+.playwright/
+
+# Misc
+.output/
+*.bak
