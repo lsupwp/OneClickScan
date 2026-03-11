@@ -75,6 +75,11 @@ def _hdr(title: str) -> None:
     print(f"\n{'='*80}\n{title}\n{'='*80}")
 
 
+def _strip_ansi(text: str) -> str:
+    """ลบ ANSI escape codes (สี/รูปแบบ) ออกจากข้อความ"""
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
 # ── SessionManager ─────────────────────────────────────────────────────
 class SessionManager:
     """Loads, saves, refreshes session cookies; handles login + CSRF."""
@@ -370,9 +375,11 @@ class CommandRunner:
         cmds, bruters = self._build(targets)
         cookie = self.session.cookie_str() if self.session else None
         print(f"[*] Output directory: {self.results.resolve()}")
+        sys.stdout.flush()
         lvl = "high only" if min_confidence == "high" else "high + medium" if min_confidence == "medium" else "all"
         print(f"[*] Mode: min-confidence {lvl}")
-        if bruters: print(f"[*] Bruter jobs (form with token): {len(bruters)} (override hydra)")
+        sys.stdout.flush()
+        if bruters: print(f"[*] Bruter jobs (form with token): {len(bruters)} (override hydra)"); sys.stdout.flush()
         if dry_run:
             for cmd, t, *_ in cmds: print(f"  {t}: {cmd[:80]}")
             for j in bruters:       print(f"  bruter: {j['url'][:60]}... (csrf={j['csrf_field']})")
@@ -381,8 +388,10 @@ class CommandRunner:
         total = len(cmds)
         print(f"[*] Commands to run: {total} (workers: {workers})" +
               (f" + {len(bruters)} bruter job(s) in parallel" if bruters else ""))
+        sys.stdout.flush()
         items = [((c, t, s, ti, ci), i+1, total, self.results, self.timeout, cookie)
                  for i, (c, t, s, ti, ci) in enumerate(cmds)]
+        run_results: list[dict] = []
         with ThreadPoolExecutor(max_workers=workers) as ex:
             fs: dict = {ex.submit(self._run_cmd, it): "cmd" for it in items}
             fs |= {ex.submit(self._run_bruter, j, user_file): ("b", j["slug"]) for j in bruters}
@@ -390,15 +399,34 @@ class CommandRunner:
                 tag = fs[f]
                 try:
                     if tag == "cmd":
-                        idx, tool, log, rc, skipped = f.result()
+                        idx, tool, log, rc, skipped, cmd = f.result()
+                        run_results.append({
+                            "idx": idx, "total": total, "tool": tool, "log": log,
+                            "exit_code": rc, "skipped": skipped, "command": cmd or "",
+                        })
                         msg = (f"[!] Skip (not found): {tool}" if skipped
                                else f"[*] Done [{idx}/{total}] {tool} -> {log}" + (f" (exit {rc})" if rc != 0 else ""))
                     else:
-                        log, rc = f.result()
+                        log, rc, bruter_cmd = f.result()
+                        run_results.append({
+                            "idx": 0, "total": total, "tool": "bruter", "log": log,
+                            "exit_code": rc, "skipped": False, "command": bruter_cmd or "",
+                        })
                         msg = f"[*] Bruter [{tag[1]}] -> {log}" + (f" (exit {rc})" if rc != 0 else "")
-                    with self._lock: print(msg)
+                    with self._lock:
+                        print(msg)
+                        sys.stdout.flush()
                 except Exception as e:
-                    with self._lock: print(f"[!] Error: {e}")
+                    with self._lock:
+                        print(f"[!] Error: {e}")
+                        sys.stdout.flush()
+        summary_path = self.results / "last_exploit_summary.json"
+        try:
+            summary_path.write_text(
+                json.dumps({"total": total, "results": run_results}, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
 
     def _build(self, targets: list) -> tuple[list, list]:
         cmds, bruters = [], []
@@ -436,7 +464,7 @@ class CommandRunner:
 
     def _run_cmd(self, item) -> tuple:
         (cmd, tool, slug, ti, ci), idx, total, results, timeout, cookie = item
-        if not _available(tool): return (idx, tool, "", -1, True)
+        if not _available(tool): return (idx, tool, "", -1, True, cmd)
         if tool.lower() == "hydra":   cmd = self._fix_hydra(cmd)
         if cookie:                     cmd = self._inject_cookie(cmd, tool, cookie)
         if tool.lower() == "xsstrike" and "--skip" not in cmd: cmd += " --skip"
@@ -449,11 +477,11 @@ class CommandRunner:
                 f"# Command:\n{cmd}\n\n# Return code: {r.returncode}\n\n"
                 f"# --- stdout ---\n{r.stdout}\n# --- stderr ---\n{r.stderr or ''}",
                 encoding="utf-8")
-            return (idx, tool, log, r.returncode, False)
+            return (idx, tool, log, r.returncode, False, cmd)
         except subprocess.TimeoutExpired:
-            return (idx, tool, log, -1, False)
+            return (idx, tool, log, -1, False, cmd)
         except Exception:
-            return (idx, tool, log, -1, False)
+            return (idx, tool, log, -1, False, cmd)
 
     def _run_bruter(self, job: dict, user_file: str | None = None) -> tuple[str, int]:
         url = job["url"] or (_scheme("127.0.0.1").rstrip("/") + "/" + job["endpoint"].lstrip("/"))
@@ -467,14 +495,15 @@ class CommandRunner:
         if job.get("extra"):                              cmd += ["--extra", job["extra"]]
         if user_file and Path(user_file).exists():        cmd += ["--user-file", user_file]
         log_path = self.results / log
+        cmd_str = " ".join(cmd)
         try:
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write(f"# Command: {' '.join(cmd)}\n")
+                lf.write(f"# Command: {cmd_str}\n")
                 r = subprocess.run(cmd, cwd=self.root, timeout=self.timeout,
                                    stdout=lf, stderr=lf)
-            return log, r.returncode
+            return log, r.returncode, cmd_str
         except Exception:
-            return log, -1
+            return log, -1, cmd_str
 
     @staticmethod
     def _fix_hydra(cmd: str) -> str:
@@ -664,8 +693,6 @@ class ExploitPipeline:
         self._run_gobuster_into(r)
         # davtest หลัง gobuster — ตรวจ upload methods บน paths ที่เจอ
         self._run_davtest_into(r)
-        # nuclei — template scan (pre-auth, no cookie)
-        self._run_nuclei_into(cookie=None)
         r.run_payload(refresh=False)
         r.print_forms()
         t = self.triage_eng.local(r.forms, r.params)
@@ -832,9 +859,6 @@ class ExploitPipeline:
         self._run_gobuster_into(r)
         # davtest หลัง gobuster — ตรวจ upload methods (authenticated)
         self._run_davtest_into(r)
-        # nuclei — template scan พร้อม session cookie
-        cookie_str = self.sess.cookie_str() if self.sess else None
-        self._run_nuclei_into(cookie=cookie_str)
         r.run_payload()
         r.print_forms()
         t2 = self.triage_eng.post_auth(r.paths, r.forms, r.params)
@@ -937,12 +961,15 @@ class ScanMode:
             out = []
             for sig, data in (forms or {}).items():
                 det = (data.get("details") or {}) if isinstance(data, dict) else {}
+                paths_raw = data.get("paths") if isinstance(data, dict) else []
+                paths = list(paths_raw) if paths_raw is not None else []
                 out.append({
                     "signature": sig,
                     "method":    det.get("method", ""),
                     "action":    det.get("target_action", ""),
                     "body_params":  det.get("body_params", {}),
                     "query_params": det.get("query_params", {}),
+                    "found_on_paths": paths,
                 })
             return out
         def _serialize_params(params: dict) -> list:
@@ -1047,14 +1074,13 @@ class ScanMode:
             print(f"[!] DAVTest error: {e}", file=sys.stderr)
 
     def _nmap(self) -> None:
-        from services.nmap_service import run_nmap_scan, parse_nmap_services, get_cve_info
+        from services.nmap_service import run_nmap_scan, parse_nmap_services
         host = urlparse(self.url).netloc or self.url
         try:
             out = run_nmap_scan(host, getattr(self.opts, "nmap_ports", 20))
             _hdr("NMAP SERVICE SCAN"); print(out)
             for p, svc, ver in parse_nmap_services(out):
-                print(f"[+] Service: {p} | {ver}")
-                print(f"    [>] CVE/Exploit: {get_cve_info(svc, ver)}")
+                print(f"[+] {p} | {svc} {ver or ''}".strip())
         except Exception as e:
             print(f"[!] Nmap error: {e}", file=sys.stderr)
 
@@ -1064,7 +1090,7 @@ class ScanMode:
         from services.cve_service import search_cves_by_query
         try:
             out = run_whatweb(self.url)
-            _hdr("WHATWEB FINGERPRINT"); print(out.strip())
+            _hdr("WHATWEB FINGERPRINT"); print(_strip_ansi(out).strip())
             seen: set[str] = set()
             for f in filter_versioned_findings(parse_whatweb_output(out)):
                 key = f"{f.product.lower()} {f.version}"
