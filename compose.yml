@@ -1,0 +1,7 @@
+services:
+  kali:
+    image: kalilinux/kali-rolling
+    container_name: kali-engine
+    tty: true
+    stdin_open: true
+    command: /bin/bash
