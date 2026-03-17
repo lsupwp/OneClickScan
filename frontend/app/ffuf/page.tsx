@@ -1,5 +1,5 @@
 import { redirect } from "next/navigation";
 
-export default function KatanaPage() {
+export default function FfufPage() {
   redirect("/scan");
 }

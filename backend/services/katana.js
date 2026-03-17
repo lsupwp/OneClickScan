@@ -209,7 +209,7 @@ async function startKatanaScan({ targetUrl, userFlags, jobId }) {
         message: 'Filtering katana results (status_code==200)...',
       });
 
-      const urls = extractUrlsFromKatanaJsonLines(stdoutBuf);
+      const { urls, statusByUrl } = extractUrlsFromKatanaJsonLines(stdoutBuf);
 
       broadcastToJob(jobId, {
         type: 'status',
@@ -228,7 +228,22 @@ async function startKatanaScan({ targetUrl, userFlags, jobId }) {
             fs.mkdirSync(hostDir, { recursive: true });
           }
 
-          fs.writeFileSync(hostResultPath, JSON.stringify(scored, null, 2), 'utf8');
+          const scoredWithStatus = scored.map((s) => ({
+            ...s,
+            status: statusByUrl[s.url] ?? null,
+          }));
+          const scoredUrlsSet = new Set(scored.map((s) => s.url));
+          const non200Entries = Object.entries(statusByUrl)
+            .filter(([url]) => !scoredUrlsSet.has(url))
+            .map(([url, status]) => ({
+              url,
+              status,
+              score: null,
+              level: null,
+              reason: null,
+            }));
+          const merged = [...scoredWithStatus, ...non200Entries];
+          fs.writeFileSync(hostResultPath, JSON.stringify(merged, null, 2), 'utf8');
 
           const scanAt = new Date().toISOString();
           insertKatanaScan(
@@ -253,10 +268,14 @@ async function startKatanaScan({ targetUrl, userFlags, jobId }) {
         })
         .catch((err) => {
           console.error('Gemini scoring failed:', err);
+          const msg = err?.message || '';
+          const is429 = /429|rate limit|resource.exhausted/i.test(msg);
           broadcastToJob(jobId, {
             type: 'error',
             jobId,
-            message: 'Gemini scoring failed',
+            message: is429
+              ? 'Gemini rate limit (429) — ลองรอสักครู่แล้วรันใหม่'
+              : msg || 'Gemini scoring failed',
           });
         });
     } catch (err) {
@@ -270,9 +289,15 @@ async function startKatanaScan({ targetUrl, userFlags, jobId }) {
   });
 }
 
+/**
+ * Parse Katana JSON-lines output.
+ * Returns { urls: string[] } (only status 200, for Gemini) and
+ * { statusByUrl: Record<string, number> } (all URLs with status for saving).
+ */
 function extractUrlsFromKatanaJsonLines(output) {
   const urls = [];
   const seen = new Set();
+  const statusByUrl = {};
   const lines = (output || '').split(/\r?\n/);
   for (const line of lines) {
     const trimmed = line.trim();
@@ -281,8 +306,11 @@ function extractUrlsFromKatanaJsonLines(output) {
       const obj = JSON.parse(trimmed);
       const status = obj?.response?.status_code;
       const url = obj?.request?.endpoint;
-      if (status === 200 && typeof url === 'string') {
-        if (!seen.has(url)) {
+      if (typeof url === 'string' && url) {
+        if (status != null && typeof status === 'number') {
+          statusByUrl[url] = status;
+        }
+        if (status === 200 && !seen.has(url)) {
           seen.add(url);
           urls.push(url);
         }
@@ -291,7 +319,7 @@ function extractUrlsFromKatanaJsonLines(output) {
       // ignore non-json lines
     }
   }
-  return urls;
+  return { urls, statusByUrl };
 }
 
 module.exports = {

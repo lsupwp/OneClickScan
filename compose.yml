@@ -1,7 +1,12 @@
 services:
   kali:
-    image: kalilinux/kali-rolling
+    build:
+      context: .
+      network: host  # <--- เพิ่มบรรทัดนี้เพื่อใช้เน็ตเดียวกับเครื่องนอกตอน Build
+    image: oneclickscan-kali
     container_name: kali-engine
     tty: true
     stdin_open: true
     command: /bin/bash
+    volumes:
+      - ./backend/temp/wordlists:/mnt/wordlists

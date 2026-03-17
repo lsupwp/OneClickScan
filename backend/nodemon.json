@@ -1,0 +1,11 @@
+{
+  "watch": ["*.js", "routes", "services", "db.js", "server.js", "websocket.js"],
+  "ignore": [
+    "result/**",
+    "temp/**",
+    "node_modules/**",
+    "*.sqlite",
+    "*.db"
+  ],
+  "ext": "js,json"
+}

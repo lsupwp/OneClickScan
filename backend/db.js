@@ -28,6 +28,23 @@ db.exec(`
     scan_at     DATETIME NOT NULL,
     FOREIGN KEY (target_id) REFERENCES target(target_id)
   );
+
+  CREATE TABLE IF NOT EXISTS ffuf (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL,
+    result_file TEXT NOT NULL,
+    wordlist_source TEXT,
+    scan_at     DATETIME NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS payload_recon (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL,
+    result_file TEXT NOT NULL,
+    scan_at     DATETIME NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
 `);
 
 // lightweight migrations for older DBs
@@ -70,6 +87,36 @@ const listKatanaByTargetStmt = db.prepare(
    ORDER BY id DESC`
 );
 
+const countFfufByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM ffuf WHERE target_id = ?'
+);
+
+const insertFfufStmt = db.prepare(
+  'INSERT INTO ffuf (target_id, result_file, wordlist_source, scan_at) VALUES (?, ?, ?, ?)'
+);
+
+const listFfufByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, wordlist_source, scan_at
+   FROM ffuf
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
+const countPayloadReconByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM payload_recon WHERE target_id = ?'
+);
+
+const insertPayloadReconStmt = db.prepare(
+  'INSERT INTO payload_recon (target_id, result_file, scan_at) VALUES (?, ?, ?)'
+);
+
+const listPayloadReconByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at
+   FROM payload_recon
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
 function getOrCreateTarget(targetName) {
   let row = getOrCreateTargetStmt.get(targetName);
   if (!row) {
@@ -98,6 +145,34 @@ function listKatanaByTarget(targetId) {
   return listKatanaByTargetStmt.all(targetId);
 }
 
+function getFfufScanRound(targetId) {
+  const { count } = countFfufByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertFfufScan(targetId, resultFile, wordlistSource, scanAt) {
+  const info = insertFfufStmt.run(targetId, resultFile, wordlistSource, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listFfufByTarget(targetId) {
+  return listFfufByTargetStmt.all(targetId);
+}
+
+function getPayloadReconScanRound(targetId) {
+  const { count } = countPayloadReconByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertPayloadRecon(targetId, resultFile, scanAt) {
+  const info = insertPayloadReconStmt.run(targetId, resultFile, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listPayloadReconByTarget(targetId) {
+  return listPayloadReconByTargetStmt.all(targetId);
+}
+
 module.exports = {
   db,
   getOrCreateTarget,
@@ -105,5 +180,11 @@ module.exports = {
   insertKatanaScan,
   listTargets,
   listKatanaByTarget,
+  getFfufScanRound,
+  insertFfufScan,
+  listFfufByTarget,
+  getPayloadReconScanRound,
+  insertPayloadRecon,
+  listPayloadReconByTarget,
 };
 

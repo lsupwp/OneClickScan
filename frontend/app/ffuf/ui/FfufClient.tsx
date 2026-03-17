@@ -4,47 +4,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import ErrorModal from "../../components/ErrorModal";
 import { validateUrl } from "../../lib/validateUrl";
 
-type KatanaFlagDefinition = {
-  name: string;
-  label: string;
-  type: "string" | "number" | "boolean";
-  required?: boolean;
-  default?: unknown;
-  multiple?: boolean;
-  description?: string;
-};
-
-type KatanaFlagsResponse = {
-  name: string;
-  description?: string;
-  defaultFlags?: string[];
-  flags?: KatanaFlagDefinition[];
-};
-
 type ScoredUrl = {
   url: string;
   score: number;
   level?: string;
   reason?: string;
+  status?: number | null;
 };
 
 type WsEvent =
-  | {
-      type: "subscribed";
-      jobId: string;
-    }
-  | {
-      type: "status";
-      jobId: string;
-      status: string;
-      message?: string;
-    }
-  | {
-      type: "progress";
-      jobId: string;
-      message: string;
-      stream?: "stderr";
-    }
+  | { type: "subscribed"; jobId: string }
+  | { type: "status"; jobId: string; status: string; message?: string }
+  | { type: "progress"; jobId: string; message: string; stream?: "stderr" }
   | {
       type: "done";
       jobId: string;
@@ -54,11 +25,7 @@ type WsEvent =
       scoredUrls?: number;
       scanAt?: string;
     }
-  | {
-      type: "error";
-      jobId: string;
-      message: string;
-    };
+  | { type: "error"; jobId: string; message: string };
 
 type ScanPhase = "idle" | "starting" | "processing" | "scoring" | "done" | "error";
 
@@ -69,7 +36,6 @@ function getBackendBaseUrl() {
 function getWsUrl() {
   const fromEnv = process.env.NEXT_PUBLIC_WS_URL;
   if (fromEnv) return fromEnv;
-  // derive from backend url
   const base = getBackendBaseUrl();
   if (base.startsWith("https://")) return base.replace("https://", "wss://");
   if (base.startsWith("http://")) return base.replace("http://", "ws://");
@@ -103,16 +69,15 @@ function scoreLabel(score: number) {
   return "Info";
 }
 
-export default function KatanaClient() {
+export default function FfufClient() {
   const backend = getBackendBaseUrl();
   const wsUrl = getWsUrl();
 
   const [targetUrl, setTargetUrl] = useState("http://113.45.171.231/");
-  const [flagValues, setFlagValues] = useState<Record<string, unknown>>({});
-  const [enabledFlags, setEnabledFlags] = useState<Record<string, boolean>>({});
-
-  const [flagsMeta, setFlagsMeta] = useState<KatanaFlagsResponse | null>(null);
-  const [flagsLoading, setFlagsLoading] = useState(false);
+  const [wordlistMode, setWordlistMode] = useState<"default" | "upload">("default");
+  const [uploadedFileId, setUploadedFileId] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [jobId, setJobId] = useState<string | null>(null);
   const [phase, setPhase] = useState<ScanPhase>("idle");
@@ -127,74 +92,23 @@ export default function KatanaClient() {
 
   const [minScore, setMinScore] = useState(1);
   const [query, setQuery] = useState("");
+
+  const [mc, setMc] = useState("");
+  const [fc, setFc] = useState("");
+  const [threads, setThreads] = useState<number | "">("");
+  const [rate, setRate] = useState<number | "">("");
+  const [extensions, setExtensions] = useState("");
+  const [followRedirects, setFollowRedirects] = useState(false);
+  const [autoCalibrate, setAutoCalibrate] = useState(false);
   const [errorModalMessage, setErrorModalMessage] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
 
-  function isScanPhase(x: string): x is Extract<
-    ScanPhase,
-    "starting" | "processing" | "scoring"
-  > {
+  function isScanPhase(
+    x: string
+  ): x is "starting" | "processing" | "scoring" {
     return x === "starting" || x === "processing" || x === "scoring";
   }
-
-  useEffect(() => {
-    let cancelled = false;
-    async function loadFlags() {
-      setFlagsLoading(true);
-      try {
-        const res = await fetch(`${backend}/api/tools/katana/flags`, {
-          cache: "no-store",
-        });
-        const data = (await res.json()) as KatanaFlagsResponse;
-        if (!cancelled) {
-          setFlagsMeta(data);
-
-          const nextEnabled: Record<string, boolean> = {};
-          const nextValues: Record<string, unknown> = {};
-
-          for (const f of data.flags || []) {
-            if (f.type === "boolean") {
-              const d = typeof f.default === "boolean" ? f.default : false;
-              nextEnabled[f.name] = d;
-              nextValues[f.name] = d;
-            } else if (f.type === "number") {
-              const d = typeof f.default === "number" ? f.default : undefined;
-              nextEnabled[f.name] = d !== undefined;
-              if (d !== undefined) nextValues[f.name] = d;
-            } else {
-              const d = typeof f.default === "string" ? f.default : "";
-              nextEnabled[f.name] = Boolean(d);
-              if (d) nextValues[f.name] = d;
-            }
-          }
-
-          // ensure depth has a sane default
-          if (nextValues["-depth"] === undefined) {
-            nextEnabled["-depth"] = true;
-            nextValues["-depth"] = 5;
-          }
-
-          setEnabledFlags(nextEnabled);
-          setFlagValues(nextValues);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setFlagsMeta(null);
-          setLogs((prev) => [
-            ...prev,
-            `Failed to load flags: ${(e as Error).message}`,
-          ]);
-        }
-      } finally {
-        if (!cancelled) setFlagsLoading(false);
-      }
-    }
-    loadFlags();
-    return () => {
-      cancelled = true;
-    };
-  }, [backend]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -215,52 +129,36 @@ export default function KatanaClient() {
       .sort((a, b) => b.score - a.score || a.url.localeCompare(b.url));
   }, [results, minScore, query]);
 
-  function buildFlagsArray() {
-    const flags: string[] = [];
-
-    // always set depth if enabled
-    const depthEnabled = enabledFlags["-depth"];
-    if (depthEnabled) {
-      const v = Number(flagValues["-depth"]);
-      if (Number.isFinite(v) && v > 0) {
-        flags.push("-d", String(v));
-      }
+  async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const ext = file.name.toLowerCase().endsWith(".txt");
+    if (!ext) {
+      setLogs((prev) => [...prev, "รับเฉพาะไฟล์ .txt เท่านั้น"]);
+      return;
     }
-
-    for (const def of flagsMeta?.flags || []) {
-      const name = def.name;
-      if (name === "-u" || name === "-depth") continue;
-      if (!enabledFlags[name]) continue;
-
-      if (def.type === "boolean") {
-        const checked = Boolean(flagValues[name]);
-        if (checked) flags.push(name);
-        continue;
+    setUploading(true);
+    setUploadedFileId(null);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch(`${backend}/api/upload/wordlist`, {
+        method: "POST",
+        body: form,
+      });
+      const data = (await res.json()) as { fileId?: string; error?: string };
+      if (!res.ok || !data.fileId) {
+        throw new Error(data.error || "Upload failed");
       }
-
-      if (def.multiple) {
-        const raw = String(flagValues[name] || "");
-        const lines = raw
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean);
-        for (const line of lines) {
-          flags.push(name, line);
-        }
-        continue;
-      }
-
-      if (def.type === "number") {
-        const v = Number(flagValues[name]);
-        if (Number.isFinite(v)) flags.push(name, String(v));
-        continue;
-      }
-
-      const v = String(flagValues[name] || "").trim();
-      if (v) flags.push(name, v);
+      setUploadedFileId(data.fileId);
+      setWordlistMode("upload");
+      setLogs((prev) => [...prev, `อัปโหลด wordlist สำเร็จ: ${file.name}`]);
+    } catch (err) {
+      setLogs((prev) => [...prev, `Upload error: ${(err as Error).message}`]);
+    } finally {
+      setUploading(false);
+      e.target.value = "";
     }
-
-    return flags;
   }
 
   async function startScan() {
@@ -276,7 +174,43 @@ export default function KatanaClient() {
     setPhase("starting");
     setStatusText("Starting...");
 
-    // connect websocket first (avoid missing early events)
+    const wordlist =
+      wordlistMode === "default"
+        ? "default"
+        : uploadedFileId
+          ? { fileId: uploadedFileId }
+          : "default";
+
+    if (wordlistMode === "upload" && !uploadedFileId) {
+      setPhase("error");
+      setStatusText("กรุณาอัปโหลดไฟล์ wordlist (.txt) ก่อน");
+      setErrorModalMessage("กรุณาอัปโหลดไฟล์ wordlist (.txt) ก่อน");
+      return;
+    }
+
+    const flags: string[] = [];
+    if (mc.trim()) {
+      flags.push("-mc", mc.trim());
+    }
+    if (fc.trim()) {
+      flags.push("-fc", fc.trim());
+    }
+    if (threads !== "" && Number(threads) > 0) {
+      flags.push("-t", String(threads));
+    }
+    if (rate !== "" && Number(rate) > 0) {
+      flags.push("-rate", String(rate));
+    }
+    if (extensions.trim()) {
+      flags.push("-e", extensions.trim());
+    }
+    if (followRedirects) {
+      flags.push("-r");
+    }
+    if (autoCalibrate) {
+      flags.push("-ac");
+    }
+
     try {
       if (socketRef.current) socketRef.current.close();
       const ws = new WebSocket(wsUrl);
@@ -295,7 +229,7 @@ export default function KatanaClient() {
           } else if (msg.type === "done") {
             setPhase("done");
             setStatusText(
-              `Completed. Scored ${msg.scoredUrls ?? "?"}/${msg.totalUrls ?? "?"}`,
+              `Completed. Scored ${msg.scoredUrls ?? "?"}/${msg.totalUrls ?? "?"}`
             );
             if (msg.resultFile) {
               setResultFile(msg.resultFile);
@@ -313,12 +247,12 @@ export default function KatanaClient() {
 
       ws.onopen = async () => {
         try {
-          const flags = buildFlagsArray();
-          const res = await fetch(`${backend}/api/scan/katana`, {
+          const res = await fetch(`${backend}/api/scan/ffuf`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               target_url: targetUrl,
+              wordlist,
               flags,
             }),
           });
@@ -359,11 +293,9 @@ export default function KatanaClient() {
     try {
       const res = await fetch(
         `${backend}/api/result?path=${encodeURIComponent(file)}`,
-        { cache: "no-store" },
+        { cache: "no-store" }
       );
-      if (!res.ok) {
-        throw new Error(`Failed to load result file (${res.status})`);
-      }
+      if (!res.ok) throw new Error(`Failed to load result (${res.status})`);
       const data = (await res.json()) as ScoredUrl[];
       setResults(data);
     } catch (e) {
@@ -385,10 +317,10 @@ export default function KatanaClient() {
       />
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-5">
         <section className="lg:col-span-2">
-          <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
-            <h2 className="text-sm font-semibold text-zinc-900">Target</h2>
+        <div className="rounded-2xl border border-zinc-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-semibold text-zinc-900">Target</h2>
           <label className="mt-3 block text-xs font-medium text-zinc-600">
-            URL
+            URL (ต้องลงท้ายด้วย / ถ้าต้องการ path ตาม wordlist)
           </label>
           <input
             value={targetUrl}
@@ -397,17 +329,175 @@ export default function KatanaClient() {
             className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm outline-none ring-sky-200 focus:ring-4"
           />
 
+          <h2 className="mt-5 text-sm font-semibold text-zinc-900">
+            Wordlist
+          </h2>
+          <div className="mt-3 space-y-3">
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="wordlist"
+                checked={wordlistMode === "default"}
+                onChange={() => setWordlistMode("default")}
+              />
+              <span className="text-sm">Default (SecLists common.txt)</span>
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="wordlist"
+                checked={wordlistMode === "upload"}
+                onChange={() => setWordlistMode("upload")}
+              />
+              <span className="text-sm">อัปโหลดไฟล์ .txt</span>
+            </label>
+            {wordlistMode === "upload" && (
+              <div className="flex items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".txt"
+                  className="hidden"
+                  onChange={handleFileSelect}
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={uploading}
+                  className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50 disabled:opacity-50"
+                >
+                  {uploading ? "Uploading..." : "เลือกไฟล์ .txt"}
+                </button>
+                {uploadedFileId && (
+                  <span className="text-xs text-zinc-500">
+                    อัปโหลดแล้ว (จะลบหลังสแกนเสร็จ)
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          <h2 className="mt-5 text-sm font-semibold text-zinc-900">
+            Advanced flags
+          </h2>
+          <p className="mt-1 text-[11px] text-zinc-500">
+            Optional ffuf options to tune hidden path fuzzing.
+          </p>
+          <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+            <div>
+              <label className="block font-semibold text-zinc-600">
+                -mc (match codes)
+              </label>
+              <input
+                value={mc}
+                onChange={(e) => setMc(e.target.value)}
+                placeholder="เช่น 200,301,302,403"
+                className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm outline-none ring-sky-200 focus:ring-4"
+              />
+            </div>
+            <div>
+              <label className="block font-semibold text-zinc-600">
+                -fc (filter codes)
+              </label>
+              <input
+                value={fc}
+                onChange={(e) => setFc(e.target.value)}
+                placeholder="เช่น 404,500"
+                className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm outline-none ring-sky-200 focus:ring-4"
+              />
+            </div>
+            <div>
+              <label className="block font-semibold text-zinc-600">
+                -t (threads)
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={threads}
+                onChange={(e) =>
+                  setThreads(
+                    e.target.value === "" ? "" : Number(e.target.value),
+                  )
+                }
+                placeholder="เช่น 40"
+                className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm outline-none ring-sky-200 focus:ring-4"
+              />
+            </div>
+            <div>
+              <label className="block font-semibold text-zinc-600">
+                -rate (req/s)
+              </label>
+              <input
+                type="number"
+                min={1}
+                value={rate}
+                onChange={(e) =>
+                  setRate(
+                    e.target.value === "" ? "" : Number(e.target.value),
+                  )
+                }
+                placeholder="0 = ไม่จำกัด"
+                className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm outline-none ring-sky-200 focus:ring-4"
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="block font-semibold text-zinc-600">
+                -e (extensions)
+              </label>
+              <input
+                value={extensions}
+                onChange={(e) => setExtensions(e.target.value)}
+                placeholder="เช่น php,html,txt"
+                className="mt-1 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs shadow-sm outline-none ring-sky-200 focus:ring-4"
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="flex items-center gap-2 font-semibold text-zinc-600">
+                <input
+                  type="checkbox"
+                  checked={followRedirects}
+                  onChange={(e) => setFollowRedirects(e.target.checked)}
+                />
+                <span>
+                  -r (follow redirects){" "}
+                  <span className="font-normal text-zinc-500">
+                    follow HTTP redirects while fuzzing
+                  </span>
+                </span>
+              </label>
+            </div>
+            <div className="col-span-2">
+              <label className="flex items-center gap-2 font-semibold text-zinc-600">
+                <input
+                  type="checkbox"
+                  checked={autoCalibrate}
+                  onChange={(e) => setAutoCalibrate(e.target.checked)}
+                />
+                <span>
+                  -ac (auto-calibrate){" "}
+                  <span className="font-normal text-zinc-500">
+                    automatically calibrate filters to ignore noisy responses
+                  </span>
+                </span>
+              </label>
+            </div>
+          </div>
+
           <div className="mt-4">
             <button
               onClick={startScan}
               className={cn(
                 "w-full rounded-xl px-4 py-2 text-sm font-semibold shadow-sm transition",
-                phase === "starting" || phase === "processing" || phase === "scoring"
+                phase === "starting" ||
+                  phase === "processing" ||
+                  phase === "scoring"
                   ? "cursor-not-allowed bg-sky-300 text-white"
-                  : "bg-sky-600 text-white hover:bg-sky-700",
+                  : "bg-sky-600 text-white hover:bg-sky-700"
               )}
               disabled={
-                phase === "starting" || phase === "processing" || phase === "scoring"
+                phase === "starting" ||
+                phase === "processing" ||
+                phase === "scoring"
               }
             >
               Start scan
@@ -426,132 +516,23 @@ export default function KatanaClient() {
                   (phase === "starting" ||
                     phase === "processing" ||
                     phase === "scoring") &&
-                    "bg-sky-100 text-sky-700",
+                    "bg-sky-100 text-sky-700"
                 )}
               >
                 {phase}
               </span>
             </div>
             <p className="mt-2 text-xs leading-5 text-zinc-600">{statusText}</p>
-            {jobId ? (
+            {jobId && (
               <p className="mt-1 text-[11px] text-zinc-500">
                 jobId: <span className="font-mono">{jobId}</span>
               </p>
-            ) : null}
-            {resultFile ? (
+            )}
+            {resultFile && (
               <p className="mt-1 text-[11px] text-zinc-500">
                 result: <span className="font-mono">{resultFile}</span>
               </p>
-            ) : null}
-          </div>
-
-          <div className="mt-5">
-            <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-zinc-900">Katana flags</h2>
-              {flagsLoading ? (
-                <span className="text-xs text-zinc-500">loading...</span>
-              ) : null}
-            </div>
-            <div className="mt-3 rounded-xl border border-zinc-200 bg-white p-3">
-              <p className="text-xs text-zinc-600">
-                Default:{" "}
-                <span className="font-mono">
-                  {(flagsMeta?.defaultFlags || []).join(" ")}
-                </span>
-              </p>
-              <div className="mt-4 space-y-3">
-                {(flagsMeta?.flags || [])
-                  .filter((f) => f.name !== "-u")
-                  .map((f) => {
-                    const enabled = Boolean(enabledFlags[f.name]);
-                    const id = `flag-${f.name.replace(/[^a-zA-Z0-9_-]/g, "")}`;
-
-                    return (
-                      <div
-                        key={f.name}
-                        className="rounded-xl border border-zinc-200 bg-zinc-50 p-3"
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <label
-                            htmlFor={id}
-                            className="flex items-start gap-2 text-sm font-semibold text-zinc-900"
-                          >
-                            <input
-                              id={id}
-                              type="checkbox"
-                              className="mt-1"
-                              checked={enabled}
-                              onChange={(e) =>
-                                setEnabledFlags((prev) => ({
-                                  ...prev,
-                                  [f.name]: e.target.checked,
-                                }))
-                              }
-                            />
-                            <span>
-                              <span className="font-mono">{f.name}</span>{" "}
-                              <span className="text-zinc-700">{f.label}</span>
-                            </span>
-                          </label>
-                        </div>
-                        {f.description ? (
-                          <p className="mt-1 text-xs text-zinc-600">
-                            {f.description}
-                          </p>
-                        ) : null}
-
-                        {f.type === "boolean" ? (
-                          <div className="mt-2 text-xs text-zinc-600">
-                            จะถูกส่งเมื่อเปิดใช้งาน
-                          </div>
-                        ) : f.multiple ? (
-                          <textarea
-                            disabled={!enabled}
-                            value={String(flagValues[f.name] || "")}
-                            onChange={(e) =>
-                              setFlagValues((prev) => ({
-                                ...prev,
-                                [f.name]: e.target.value,
-                              }))
-                            }
-                            placeholder="ใส่ 1 ค่า / 1 บรรทัด (เช่น Authorization: Bearer xxx)"
-                            className="mt-2 h-20 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm outline-none ring-sky-200 focus:ring-4 disabled:bg-zinc-100"
-                          />
-                        ) : (
-                          <input
-                            disabled={!enabled}
-                            type={f.type === "number" ? "number" : "text"}
-                            value={
-                              f.type === "number"
-                                ? String(flagValues[f.name] ?? "")
-                                : String(flagValues[f.name] ?? "")
-                            }
-                            placeholder={
-                              f.name === "-timeout"
-                                ? "ตัวอย่าง: 10 (วินาที)"
-                                : f.name === "-c"
-                                  ? "ตัวอย่าง: 10 (จำนวน concurrent fetchers)"
-                                  : f.name === "-s"
-                                    ? "ตัวอย่าง: depth-first หรือ breadth-first"
-                                    : undefined
-                            }
-                            onChange={(e) =>
-                              setFlagValues((prev) => ({
-                                ...prev,
-                                [f.name]:
-                                  f.type === "number"
-                                    ? Number(e.target.value)
-                                    : e.target.value,
-                              }))
-                            }
-                            className="mt-2 w-full rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm outline-none ring-sky-200 focus:ring-4 disabled:bg-zinc-100"
-                          />
-                        )}
-                      </div>
-                    );
-                  })}
-              </div>
-            </div>
+            )}
           </div>
         </div>
 
@@ -561,9 +542,7 @@ export default function KatanaClient() {
             {logs.length ? (
               logs.map((l, i) => <div key={i}>{l}</div>)
             ) : (
-              <div className="text-zinc-400">
-                กด Start scan แล้วดู output ที่นี่
-              </div>
+              <div className="text-zinc-400">กด Start scan แล้วดู output ที่นี่</div>
             )}
             <div ref={logEndRef} />
           </div>
@@ -579,7 +558,6 @@ export default function KatanaClient() {
                 แสดง URL ที่ได้คะแนนจาก Gemini (ยิ่งมากยิ่งเสี่ยง)
               </p>
             </div>
-
             <div className="flex flex-wrap gap-3">
               <div>
                 <label className="block text-[11px] font-semibold text-zinc-600">
@@ -604,7 +582,7 @@ export default function KatanaClient() {
                 <input
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
-                  placeholder="wp-admin, xmlrpc..."
+                  placeholder="wp-admin, login..."
                   className="mt-1 w-56 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm shadow-sm outline-none ring-sky-200 focus:ring-4"
                 />
               </div>
@@ -612,23 +590,22 @@ export default function KatanaClient() {
           </div>
 
           <div className="mt-4">
-            {resultsLoading ? (
+            {resultsLoading && (
               <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600">
                 Loading result file...
               </div>
-            ) : null}
-
-            {!results && !resultsLoading ? (
+            )}
+            {!results && !resultsLoading && (
               <div className="rounded-xl border border-zinc-200 bg-zinc-50 p-4 text-sm text-zinc-600">
-                ยังไม่มีผลลัพธ์ (รอ scan เสร็จแล้วระบบจะโหลดไฟล์อัตโนมัติ)
+                ยังไม่มีผลลัพธ์ (รอ scan เสร็จแล้วระบบจะโหลดอัตโนมัติ)
               </div>
-            ) : null}
-
-            {filteredResults ? (
+            )}
+            {filteredResults && (
               <div className="mt-3 overflow-hidden rounded-2xl border border-zinc-200">
                 <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
+                  <div className="col-span-1">Status</div>
                   <div className="col-span-2">Score</div>
-                  <div className="col-span-10">URL</div>
+                  <div className="col-span-9">URL</div>
                 </div>
                 <div className="divide-y divide-zinc-100">
                   {filteredResults.map((r) => (
@@ -636,6 +613,15 @@ export default function KatanaClient() {
                       key={r.url}
                       className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
                     >
+                      <div className="col-span-1">
+                        {r.status != null ? (
+                          <span className="font-mono text-xs font-medium text-zinc-700">
+                            {r.status}
+                          </span>
+                        ) : (
+                          <span className="text-zinc-400">—</span>
+                        )}
+                      </div>
                       <div className="col-span-2">
                         <div className="flex items-center gap-2">
                           <span
@@ -652,7 +638,7 @@ export default function KatanaClient() {
                           </span>
                         </div>
                       </div>
-                      <div className="col-span-10">
+                      <div className="col-span-9">
                         <a
                           href={r.url}
                           target="_blank"
@@ -662,17 +648,17 @@ export default function KatanaClient() {
                         >
                           {r.url}
                         </a>
-                        {r.reason ? (
+                        {r.reason && (
                           <p className="mt-1 line-clamp-2 text-xs leading-5 text-zinc-600">
                             {r.reason}
                           </p>
-                        ) : null}
+                        )}
                       </div>
                     </div>
                   ))}
                 </div>
               </div>
-            ) : null}
+            )}
           </div>
         </div>
       </section>
@@ -680,4 +666,3 @@ export default function KatanaClient() {
     </>
   );
 }
-

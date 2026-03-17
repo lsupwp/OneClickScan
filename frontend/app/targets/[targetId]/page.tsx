@@ -8,6 +8,14 @@ type KatanaScanRow = {
   scan_at: string;
 };
 
+type FfufScanRow = {
+  id: number;
+  target_id: number;
+  result_file: string;
+  wordlist_source: string | null;
+  scan_at: string;
+};
+
 type TargetRow = {
   target_id: number;
   target_name: string;
@@ -28,6 +36,15 @@ async function getKatanaScans(targetId: number) {
   });
   if (!res.ok) throw new Error("Failed to load scans");
   return (await res.json()) as KatanaScanRow[];
+}
+
+async function getFfufScans(targetId: number) {
+  const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080";
+  const res = await fetch(`${base}/api/targets/${targetId}/ffuf`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("Failed to load ffuf scans");
+  return (await res.json()) as FfufScanRow[];
 }
 
 function formatFlags(flagsJson: string | null) {
@@ -55,6 +72,7 @@ export default async function TargetDetailPage({
   const id = Number(targetId);
   const target = Number.isFinite(id) ? await getTargets(id) : null;
   const scans = Number.isFinite(id) ? await getKatanaScans(id) : [];
+  const ffufScans = Number.isFinite(id) ? await getFfufScans(id) : [];
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -80,11 +98,18 @@ export default async function TargetDetailPage({
               href="/katana"
               className="rounded-lg bg-sky-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-sky-700"
             >
-              New scan
+              Katana
+            </Link>
+            <Link
+              href="/ffuf"
+              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
+            >
+              FFuf
             </Link>
           </div>
         </header>
 
+        <h2 className="mb-3 text-sm font-semibold text-zinc-900">Katana</h2>
         <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
           <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
             <div className="col-span-2">Scan</div>
@@ -118,7 +143,45 @@ export default async function TargetDetailPage({
               ))
             ) : (
               <div className="px-4 py-10 text-sm text-zinc-600">
-                ยังไม่มีประวัติ scan
+                ยังไม่มีประวัติ Katana
+              </div>
+            )}
+          </div>
+        </div>
+
+        <h2 className="mb-3 mt-8 text-sm font-semibold text-zinc-900">FFuf Hidden Path</h2>
+        <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
+          <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
+            <div className="col-span-2">Scan</div>
+            <div className="col-span-4">Scanned at</div>
+            <div className="col-span-4">Wordlist</div>
+            <div className="col-span-2">Result</div>
+          </div>
+          <div className="divide-y divide-zinc-100">
+            {ffufScans.length ? (
+              ffufScans.map((s) => (
+                <Link
+                  key={s.id}
+                  href={`/targets/${id}/ffuf/${s.id}`}
+                  className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
+                >
+                  <div className="col-span-2 text-sm font-semibold text-zinc-900">
+                    #{s.id}
+                  </div>
+                  <div className="col-span-4 text-sm text-zinc-700">
+                    {s.scan_at}
+                  </div>
+                  <div className="col-span-4 text-sm text-zinc-600">
+                    {s.wordlist_source || "-"}
+                  </div>
+                  <div className="col-span-2 truncate text-sm font-medium text-sky-700">
+                    Open →
+                  </div>
+                </Link>
+              ))
+            ) : (
+              <div className="px-4 py-10 text-sm text-zinc-600">
+                ยังไม่มีประวัติ FFuf
               </div>
             )}
           </div>
