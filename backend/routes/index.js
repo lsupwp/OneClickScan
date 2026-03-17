@@ -13,6 +13,7 @@ const { analyzePayloadReconWithGemini } = require('../services/payload-analyze')
 const { startNucleiScan } = require('../services/nuclei');
 const { startWhatwebScan } = require('../services/whatweb');
 const { startSubfinderScan } = require('../services/subfinder');
+const { startLanScan } = require('../services/lan-scanner');
 const { startPayloadToolRun } = require('../services/payload-run');
 const {
   listTargets,
@@ -190,6 +191,30 @@ router.post('/scan/subfinder', async (req, res) => {
   } catch (err) {
     console.error('Failed to start subfinder scan:', err);
     res.status(500).json({ error: 'Failed to start subfinder scan' });
+  }
+});
+
+router.post('/scan/lan', async (req, res) => {
+  const { cidr, mode, ports } = req.body || {};
+
+  if (!cidr || typeof cidr !== 'string') {
+    return res.status(400).json({ error: 'cidr is required' });
+  }
+
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+  try {
+    await startLanScan({
+      cidr: cidr.trim(),
+      mode: mode === 'accurate' ? 'accurate' : 'fast',
+      ports: typeof ports === 'string' && ports.trim() ? ports.trim() : 'top100',
+      jobId,
+    });
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('Failed to start lan scan:', err);
+    res.status(500).json({ error: 'Failed to start lan scan' });
   }
 });
 

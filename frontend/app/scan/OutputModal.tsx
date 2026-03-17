@@ -6,6 +6,7 @@ import PayloadReconOutput from "./output/PayloadReconOutput";
 import NucleiOutput from "./output/NucleiOutput";
 import WhatWebOutput from "./output/WhatWebOutput";
 import SubfinderOutput from "./output/SubfinderOutput";
+import LanOutput from "./output/LanOutput";
 
 export type PayloadEntry = {
   found_in: string[];
@@ -18,7 +19,7 @@ export type PayloadEntry = {
 type OutputModalProps = {
   open: boolean;
   onClose: () => void;
-  toolId: "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
+  toolId: "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan";
   title: string;
   phase: "running" | "done" | "error";
   status: string;
@@ -36,6 +37,7 @@ const TOOL_STYLE: Record<string, { bg: string; accent: string; label: string }> 
   nuclei: { bg: "bg-zinc-50", accent: "text-zinc-800", label: "Nuclei" },
   whatweb: { bg: "bg-zinc-50", accent: "text-zinc-800", label: "WhatWeb" },
   subfinder: { bg: "bg-zinc-50", accent: "text-zinc-800", label: "Subfinder" },
+  lan: { bg: "bg-emerald-50", accent: "text-emerald-700", label: "LAN Scanner" },
 };
 
 export default function OutputModal({
@@ -96,6 +98,7 @@ export default function OutputModal({
           {toolId === "nuclei" && <NucleiOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
           {toolId === "whatweb" && <WhatWebOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
           {toolId === "subfinder" && <SubfinderOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
+          {toolId === "lan" && <LanOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
         </div>
       </div>
     </div>

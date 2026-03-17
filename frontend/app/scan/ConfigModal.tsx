@@ -2,7 +2,7 @@
 
 import { useRef } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan";
 type KatanaFlagDef = {
   name: string;
   label: string;
@@ -48,6 +48,15 @@ type ConfigModalProps = {
   // Subfinder
   subfinderHttpxTimeoutSec: number | "";
   setSubfinderHttpxTimeoutSec: (v: number | "") => void;
+  // LAN
+  lanCidr: string;
+  setLanCidr: (v: string) => void;
+  lanMode: "fast" | "accurate";
+  setLanMode: (v: "fast" | "accurate") => void;
+  lanPortsPreset: "top100" | "top1000" | "custom";
+  setLanPortsPreset: (v: "top100" | "top1000" | "custom") => void;
+  lanCustomPorts: string;
+  setLanCustomPorts: (v: string) => void;
 };
 
 export default function ConfigModal({
@@ -82,6 +91,14 @@ export default function ConfigModal({
   setWhatwebAggression,
   subfinderHttpxTimeoutSec,
   setSubfinderHttpxTimeoutSec,
+  lanCidr,
+  setLanCidr,
+  lanMode,
+  setLanMode,
+  lanPortsPreset,
+  setLanPortsPreset,
+  lanCustomPorts,
+  setLanCustomPorts,
 }: ConfigModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
 
@@ -102,7 +119,9 @@ export default function ConfigModal({
             ? "WhatWeb"
             : tool === "subfinder"
               ? "Subfinder"
-              : "Payload Recon";
+              : tool === "lan"
+                ? "LAN Scanner"
+                : "Payload Recon";
   const subtitle =
     tool === "katana"
       ? "ตั้งค่า flags สำหรับ crawl"
@@ -114,7 +133,9 @@ export default function ConfigModal({
             ? "Fingerprint และสรุป plugins แบบ dynamic JSON"
           : tool === "subfinder"
             ? "หา subdomains ด้วย subfinder และเช็ค alive ด้วย httpx (เก็บเฉพาะ status 200)"
-          : "รันหลัง Katana/FFuf เสร็จ";
+          : tool === "lan"
+            ? "สแกน LAN จาก CIDR แล้วสรุป host + ports"
+            : "รันหลัง Katana/FFuf เสร็จ";
 
   return (
     <div
@@ -312,6 +333,100 @@ export default function ConfigModal({
                     จะใช้ scheme ตาม URL ที่ใส่มา (http/https) แล้วเก็บเฉพาะ subdomain ที่ตอบ status 200
                   </p>
                 </div>
+              </div>
+            </section>
+          )}
+
+          {tool === "lan" && (
+            <section className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 space-y-4">
+              <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-emerald-100 text-emerald-700 text-xs font-bold">
+                  L
+                </span>
+                LAN Scanner
+              </h3>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="sm:col-span-1">
+                  <label className="block text-xs font-semibold text-zinc-600">CIDR</label>
+                  <input
+                    type="text"
+                    value={lanCidr}
+                    onChange={(e) => setLanCidr(e.target.value)}
+                    placeholder="192.168.1.0/24"
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-mono text-zinc-900"
+                  />
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    ใช้รูปแบบ CIDR เช่น <span className="font-mono">192.168.1.0/24</span>
+                  </p>
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-600">Mode</label>
+                  <div className="mt-1 flex gap-3 text-xs">
+                    <label className="flex items-center gap-2 cursor-pointer text-zinc-700">
+                      <input
+                        type="radio"
+                        checked={lanMode === "fast"}
+                        onChange={() => setLanMode("fast")}
+                        className="text-emerald-600"
+                      />
+                      fast
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer text-zinc-700">
+                      <input
+                        type="radio"
+                        checked={lanMode === "accurate"}
+                        onChange={() => setLanMode("accurate")}
+                        className="text-emerald-600"
+                      />
+                      accurate
+                    </label>
+                  </div>
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    fast = ไวกว่า, accurate = retry + TTL OS guess
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-xs font-semibold text-zinc-600">Ports</label>
+                <div className="flex flex-wrap gap-4 text-xs">
+                  <label className="flex items-center gap-2 cursor-pointer text-zinc-700">
+                    <input
+                      type="radio"
+                      checked={lanPortsPreset === "top100"}
+                      onChange={() => setLanPortsPreset("top100")}
+                      className="text-emerald-600"
+                    />
+                    top100
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer text-zinc-700">
+                    <input
+                      type="radio"
+                      checked={lanPortsPreset === "top1000"}
+                      onChange={() => setLanPortsPreset("top1000")}
+                      className="text-emerald-600"
+                    />
+                    top1000
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer text-zinc-700">
+                    <input
+                      type="radio"
+                      checked={lanPortsPreset === "custom"}
+                      onChange={() => setLanPortsPreset("custom")}
+                      className="text-emerald-600"
+                    />
+                    custom
+                  </label>
+                </div>
+                {lanPortsPreset === "custom" && (
+                  <input
+                    type="text"
+                    value={lanCustomPorts}
+                    onChange={(e) => setLanCustomPorts(e.target.value)}
+                    placeholder="22,80,443,445,3389 หรือ 20-25,80,443"
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-mono text-zinc-900"
+                  />
+                )}
               </div>
             </section>
           )}

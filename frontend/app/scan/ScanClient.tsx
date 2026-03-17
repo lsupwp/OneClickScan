@@ -18,7 +18,7 @@ const WS_URL = () => {
   return b.replace("http://", "ws://");
 };
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan";
 type JobPhase = "idle" | "starting" | "processing" | "scoring" | "done" | "error";
 
 type KatanaFlagDef = {
@@ -58,6 +58,7 @@ export default function ScanClient() {
     nuclei: false,
     whatweb: false,
     subfinder: false,
+    lan: false,
   });
 
   const [errorModalMessage, setErrorModalMessage] = useState<string | null>(null);
@@ -117,6 +118,19 @@ export default function ScanClient() {
   const [subfinderResultFile, setSubfinderResultFile] = useState<string | null>(null);
   const [subfinderLogs, setSubfinderLogs] = useState<string[]>([]);
 
+  // LAN job state
+  const [lanPhase, setLanPhase] = useState<JobPhase>("idle");
+  const [lanStatus, setLanStatus] = useState("");
+  const [lanJobId, setLanJobId] = useState<string | null>(null);
+  const [lanResultFile, setLanResultFile] = useState<string | null>(null);
+  const [lanLogs, setLanLogs] = useState<string[]>([]);
+
+  // LAN config
+  const [lanCidr, setLanCidr] = useState("192.168.1.0/24");
+  const [lanMode, setLanMode] = useState<"fast" | "accurate">("fast");
+  const [lanPortsPreset, setLanPortsPreset] = useState<"top100" | "top1000" | "custom">("top100");
+  const [lanCustomPorts, setLanCustomPorts] = useState("");
+
   const [payloadPhase, setPayloadPhase] = useState<"idle" | "running" | "done" | "error">("idle");
   const [payloadEntries, setPayloadEntries] = useState<PayloadEntry[] | null>(null);
   const [payloadResultFile, setPayloadResultFile] = useState<string | null>(null);
@@ -131,6 +145,7 @@ export default function ScanClient() {
   const nucleiWsRef = useRef<WebSocket | null>(null);
   const whatwebWsRef = useRef<WebSocket | null>(null);
   const subfinderWsRef = useRef<WebSocket | null>(null);
+  const lanWsRef = useRef<WebSocket | null>(null);
   const payloadReconStartedRef = useRef(false);
 
   const anyRunning =
@@ -149,6 +164,9 @@ export default function ScanClient() {
     subfinderPhase === "starting" ||
     subfinderPhase === "processing" ||
     subfinderPhase === "scoring" ||
+    lanPhase === "starting" ||
+    lanPhase === "processing" ||
+    lanPhase === "scoring" ||
     payloadPhase === "running";
 
   useEffect(() => {
@@ -192,6 +210,7 @@ export default function ScanClient() {
       nucleiWsRef.current?.close();
       whatwebWsRef.current?.close();
       subfinderWsRef.current?.close();
+      lanWsRef.current?.close();
     };
   }, []);
 
@@ -342,18 +361,32 @@ export default function ScanClient() {
   }
 
   function handleRunClick() {
-    const urlErr = validateUrl(targetUrl);
-    if (urlErr) {
-      setErrorModalMessage(urlErr);
-      return;
+    const runAnyUrlTool =
+      selectedTools.katana ||
+      selectedTools.ffuf ||
+      selectedTools.payload_recon ||
+      selectedTools.nuclei ||
+      selectedTools.whatweb ||
+      selectedTools.subfinder;
+    if (runAnyUrlTool) {
+      const urlErr = validateUrl(targetUrl);
+      if (urlErr) {
+        setErrorModalMessage(urlErr);
+        return;
+      }
     }
     const runKatana = selectedTools.katana;
     const runFfuf = selectedTools.ffuf;
     const runNuclei = selectedTools.nuclei;
     const runWhatweb = selectedTools.whatweb;
     const runSubfinder = selectedTools.subfinder;
-    if (!runKatana && !runFfuf && !runNuclei && !runWhatweb && !runSubfinder) {
+    const runLan = selectedTools.lan;
+    if (!runKatana && !runFfuf && !runNuclei && !runWhatweb && !runSubfinder && !runLan) {
       setErrorModalMessage("กรุณาเลือกอย่างน้อย 1 tool");
+      return;
+    }
+    if (runLan && !lanCidr.trim()) {
+      setErrorModalMessage("กรุณาใส่ CIDR สำหรับ LAN scan");
       return;
     }
     startRun();
@@ -366,6 +399,7 @@ export default function ScanClient() {
     const runNuclei = selectedTools.nuclei && nucleiPhase !== "done";
     const runWhatweb = selectedTools.whatweb && whatwebPhase !== "done";
     const runSubfinder = selectedTools.subfinder && subfinderPhase !== "done";
+    const runLan = selectedTools.lan && lanPhase !== "done";
     if (runFfuf && ffufWordlistMode === "upload" && !ffufUploadedFileId) {
       setErrorModalMessage("กรุณาอัปโหลด wordlist (.txt) สำหรับ FFuf ก่อน");
       return;
@@ -391,6 +425,13 @@ export default function ScanClient() {
       setSubfinderJobId(null);
       setSubfinderResultFile(null);
       setSubfinderLogs([]);
+    }
+    if (runLan) {
+      setLanPhase("idle");
+      setLanStatus("");
+      setLanJobId(null);
+      setLanResultFile(null);
+      setLanLogs([]);
     }
     setPayloadPhase("idle");
     setPayloadEntries(null);
@@ -655,6 +696,73 @@ export default function ScanClient() {
       };
     }
 
+    if (runLan) {
+      setLanPhase("starting");
+      setLanStatus("Connecting...");
+      lanWsRef.current?.close();
+      const ws = new WebSocket(wsUrl);
+      lanWsRef.current = ws;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "status") {
+            setLanPhase(
+              msg.status === "starting" || msg.status === "processing" || msg.status === "scoring"
+                ? msg.status
+                : "starting",
+            );
+            if (msg.message) setLanStatus(msg.message);
+          } else if (msg.type === "progress" && msg.message?.trim()) {
+            setLanLogs((prev) => [...prev, msg.message.trimEnd()]);
+          } else if (msg.type === "done") {
+            setLanPhase("done");
+            setLanStatus("Done.");
+            if (msg.resultFile) setLanResultFile(msg.resultFile);
+          } else if (msg.type === "error") {
+            setLanPhase("error");
+            setLanStatus(msg.message);
+          }
+        } catch {
+          // ignore
+        }
+      };
+      ws.onopen = async () => {
+        try {
+          let ports: string;
+          if (lanPortsPreset === "custom") {
+            ports = lanCustomPorts.trim() || "top100";
+          } else {
+            ports = lanPortsPreset;
+          }
+          const res = await fetch(`${backend}/api/scan/lan`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              cidr: lanCidr.trim(),
+              mode: lanMode,
+              ports,
+            }),
+          });
+          const data = (await res.json()) as { jobId?: string; error?: string };
+          if (!data.jobId) {
+            setLanPhase("error");
+            setLanStatus(data.error || "Failed to start");
+            return;
+          }
+          setLanJobId(data.jobId);
+          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+          setLanStatus("Subscribed. Running...");
+        } catch (e) {
+          setLanPhase("error");
+          setLanStatus((e as Error).message);
+        }
+      };
+      ws.onerror = () => {
+        setLanPhase("error");
+        setLanStatus("WebSocket error");
+      };
+    }
+
   }
 
   function resetKatanaForRescan() {
@@ -686,7 +794,7 @@ export default function ScanClient() {
   function resetAllRound() {
     resetKatanaForRescan();
     resetFfufForRescan();
-    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false, whatweb: false, subfinder: false });
+    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false, whatweb: false, subfinder: false, lan: false });
     setNucleiPhase("idle");
     setNucleiStatus("");
     setNucleiJobId(null);
@@ -702,6 +810,11 @@ export default function ScanClient() {
     setSubfinderJobId(null);
     setSubfinderResultFile(null);
     setSubfinderLogs([]);
+    setLanPhase("idle");
+    setLanStatus("");
+    setLanJobId(null);
+    setLanResultFile(null);
+    setLanLogs([]);
     setOutputModalTool(null);
     setConfigModalTool(null);
   }
@@ -818,6 +931,7 @@ export default function ScanClient() {
                 { id: "nuclei" as const, label: "Nuclei", desc: "Templates scan (filtered JSON output)" },
                 { id: "whatweb" as const, label: "WhatWeb", desc: "Fingerprint (dynamic plugins JSON)" },
                 { id: "subfinder" as const, label: "Subfinder", desc: "Subdomains + httpx (alive 200)" },
+                { id: "lan" as const, label: "LAN Scanner", desc: "สแกน LAN จาก CIDR" },
               ] as const
             ).map(({ id, label, desc }) => (
               <label
@@ -1027,9 +1141,38 @@ export default function ScanClient() {
                 } : undefined}
               />
             )}
+
+            {selectedTools.lan && (
+              <ToolCard
+                label="LAN Scanner"
+                phase={lanPhase}
+                status={lanStatus}
+                configSummary={`${lanCidr} • ${lanMode} • ${
+                  lanPortsPreset === "custom" ? (lanCustomPorts || "ports: custom") : lanPortsPreset
+                }`}
+                onClick={() => {
+                  if (lanPhase === "idle") setConfigModalTool("lan");
+                  else setOutputModalTool("lan");
+                }}
+                canClickOutput={lanPhase === "done" || lanPhase === "error"}
+                isRunning={lanPhase === "starting" || lanPhase === "processing" || lanPhase === "scoring"}
+                clickable={true}
+                onRescan={
+                  lanPhase === "done" || lanPhase === "error"
+                    ? () => {
+                        setLanPhase("idle");
+                        setLanStatus("");
+                        setLanJobId(null);
+                        setLanResultFile(null);
+                        setLanLogs([]);
+                      }
+                    : undefined
+                }
+              />
+            )}
           </div>
 
-          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && !selectedTools.whatweb && !selectedTools.subfinder && (
+          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && !selectedTools.whatweb && !selectedTools.subfinder && !selectedTools.lan && (
             <div className="rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 p-12 text-center">
               <p className="text-sm font-medium text-zinc-500">เลือก tools ด้านซ้าย จะเปิด modal ตั้งค่าของ tool นั้น แล้วกด Run เพื่อเริ่มสแกน</p>
             </div>
@@ -1069,6 +1212,14 @@ export default function ScanClient() {
         setWhatwebAggression={setWhatwebAggression}
         subfinderHttpxTimeoutSec={subfinderHttpxTimeoutSec}
         setSubfinderHttpxTimeoutSec={setSubfinderHttpxTimeoutSec}
+        lanCidr={lanCidr}
+        setLanCidr={setLanCidr}
+        lanMode={lanMode}
+        setLanMode={setLanMode}
+        lanPortsPreset={lanPortsPreset}
+        setLanPortsPreset={setLanPortsPreset}
+        lanCustomPorts={lanCustomPorts}
+        setLanCustomPorts={setLanCustomPorts}
       />
 
       <OutputModal
@@ -1091,9 +1242,53 @@ export default function ScanClient() {
                 ? "error"
                 : "done"
         }
-        status={outputModalTool === "katana" ? katanaStatus : outputModalTool === "ffuf" ? ffufStatus : outputModalTool === "nuclei" ? nucleiStatus : outputModalTool === "whatweb" ? whatwebStatus : outputModalTool === "subfinder" ? subfinderStatus : payloadPhase === "done" ? `พบ ${payloadEntries?.length ?? 0} รายการ` : "เกิดข้อผิดพลาด"}
-        logs={outputModalTool === "katana" ? katanaLogs : outputModalTool === "ffuf" ? ffufLogs : outputModalTool === "nuclei" ? nucleiLogs : outputModalTool === "whatweb" ? whatwebLogs : outputModalTool === "subfinder" ? subfinderLogs : undefined}
-        resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : outputModalTool === "nuclei" ? nucleiResultFile : outputModalTool === "whatweb" ? whatwebResultFile : outputModalTool === "subfinder" ? subfinderResultFile : null}
+        status={
+          outputModalTool === "katana"
+            ? katanaStatus
+            : outputModalTool === "ffuf"
+              ? ffufStatus
+              : outputModalTool === "nuclei"
+                ? nucleiStatus
+                : outputModalTool === "whatweb"
+                  ? whatwebStatus
+                  : outputModalTool === "subfinder"
+                    ? subfinderStatus
+                    : outputModalTool === "lan"
+                      ? lanStatus
+                      : payloadPhase === "done"
+                        ? `พบ ${payloadEntries?.length ?? 0} รายการ`
+                        : "เกิดข้อผิดพลาด"
+        }
+        logs={
+          outputModalTool === "katana"
+            ? katanaLogs
+            : outputModalTool === "ffuf"
+              ? ffufLogs
+              : outputModalTool === "nuclei"
+                ? nucleiLogs
+                : outputModalTool === "whatweb"
+                  ? whatwebLogs
+                  : outputModalTool === "subfinder"
+                    ? subfinderLogs
+                    : outputModalTool === "lan"
+                      ? lanLogs
+                      : undefined
+        }
+        resultFile={
+          outputModalTool === "katana"
+            ? katanaResultFile
+            : outputModalTool === "ffuf"
+              ? ffufResultFile
+              : outputModalTool === "nuclei"
+                ? nucleiResultFile
+                : outputModalTool === "whatweb"
+                  ? whatwebResultFile
+                  : outputModalTool === "subfinder"
+                    ? subfinderResultFile
+                    : outputModalTool === "lan"
+                      ? lanResultFile
+                      : null
+        }
         backend={backend}
         payloadEntries={outputModalTool === "payload_recon" ? payloadEntries : undefined}
         payloadReconId={outputModalTool === "payload_recon" ? payloadReconId : null}
