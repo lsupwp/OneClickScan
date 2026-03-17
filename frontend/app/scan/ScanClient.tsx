@@ -92,6 +92,7 @@ export default function ScanClient() {
   const [payloadPhase, setPayloadPhase] = useState<"idle" | "running" | "done" | "error">("idle");
   const [payloadEntries, setPayloadEntries] = useState<PayloadEntry[] | null>(null);
   const [payloadResultFile, setPayloadResultFile] = useState<string | null>(null);
+  const [payloadReconId, setPayloadReconId] = useState<number | null>(null);
 
   const [configModalTool, setConfigModalTool] = useState<null | ToolId>(null);
   const [outputModalTool, setOutputModalTool] = useState<null | "katana" | "ffuf" | "payload_recon">(null);
@@ -409,6 +410,8 @@ export default function ScanClient() {
     payloadReconStartedRef.current = false;
     setPayloadPhase("idle");
     setPayloadEntries(null);
+    setPayloadResultFile(null);
+    setPayloadReconId(null);
   }
 
   function resetFfufForRescan() {
@@ -420,6 +423,8 @@ export default function ScanClient() {
     payloadReconStartedRef.current = false;
     setPayloadPhase("idle");
     setPayloadEntries(null);
+    setPayloadResultFile(null);
+    setPayloadReconId(null);
   }
 
   function resetAllRound() {
@@ -484,6 +489,13 @@ export default function ScanClient() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ urls: filtered, target_url: targetUrl.trim() }),
       });
+      const headerId = res.headers.get("x-payload-recon-id");
+      const headerFile = res.headers.get("x-payload-recon-result-file");
+      if (headerId) {
+        const n = Number(headerId);
+        if (Number.isFinite(n)) setPayloadReconId(n);
+      }
+      if (headerFile) setPayloadResultFile(headerFile);
       const data = (await res.json()) as PayloadEntry[] | { error?: string };
       if (Array.isArray(data)) {
         setPayloadPhase("done");
@@ -732,6 +744,7 @@ export default function ScanClient() {
         resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : null}
         backend={backend}
         payloadEntries={outputModalTool === "payload_recon" ? payloadEntries : undefined}
+        payloadReconId={outputModalTool === "payload_recon" ? payloadReconId : null}
       />
 
       <LoadPreviousModal
@@ -765,6 +778,7 @@ export default function ScanClient() {
             setSelectedTools((prev) => ({ ...prev, payload_recon: true }));
             setPayloadPhase("done");
             setPayloadResultFile(sel.payload_recon.result_file);
+            setPayloadReconId(sel.payload_recon.id);
             setPayloadEntries(null);
             // load payload entries from file
             fetch(`${backend}/api/result?path=${encodeURIComponent(sel.payload_recon.result_file)}`, { cache: "no-store" })
@@ -780,6 +794,7 @@ export default function ScanClient() {
             setPayloadPhase("idle");
             setPayloadEntries(null);
             setPayloadResultFile(null);
+            setPayloadReconId(null);
           }
         }}
       />

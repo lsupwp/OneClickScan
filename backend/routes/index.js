@@ -9,6 +9,7 @@ const {
   WORDLIST_UPLOAD_DIR,
 } = require('../services/ffuf-hidden-path');
 const { runPayloadRecon } = require('../services/payload-recon');
+const { analyzePayloadReconWithGemini } = require('../services/payload-analyze');
 const {
   listTargets,
   listKatanaByTarget,
@@ -17,6 +18,9 @@ const {
   getPayloadReconScanRound,
   insertPayloadRecon,
   listPayloadReconByTarget,
+  getPayloadReconById,
+  insertPayloadReconAi,
+  listPayloadReconAiByRecon,
 } = require('../db');
 
 const router = express.Router();
@@ -184,7 +188,34 @@ router.post('/payload/recon', async (req, res) => {
         const outFile = path.join(baseDir, `payload-recon-${round}.json`);
         fs.writeFileSync(outFile, JSON.stringify(result, null, 2), 'utf8');
         const rel = path.relative(path.join(__dirname, '..'), outFile);
-        insertPayloadRecon(target.target_id, rel, new Date().toISOString());
+        const scanAt = new Date().toISOString();
+        const payloadReconId = insertPayloadRecon(target.target_id, rel, scanAt);
+        res.setHeader('X-Payload-Recon-Id', String(payloadReconId));
+        res.setHeader('X-Payload-Recon-Result-File', rel);
+
+        // Auto-analyze after payload recon if not already analyzed successfully.
+        // If the latest AI result is an error, allow retry.
+        setImmediate(async () => {
+          try {
+            const existing = listPayloadReconAiByRecon(payloadReconId);
+            if (existing && existing.length && !existing[0].error) return;
+            const model = process.env.GEMINI_MODEL || null;
+            const aiOut = await analyzePayloadReconWithGemini(result);
+            const aiFile = path.join(baseDir, `payload-recon-ai-${payloadReconId}-${Date.now()}.json`);
+            fs.writeFileSync(aiFile, JSON.stringify(aiOut, null, 2), 'utf8');
+            const aiRel = path.relative(path.join(__dirname, '..'), aiFile);
+            insertPayloadReconAi(payloadReconId, aiRel, model, null, new Date().toISOString());
+          } catch (e) {
+            try {
+              const aiFile = path.join(baseDir, `payload-recon-ai-${payloadReconId}-${Date.now()}.json`);
+              fs.writeFileSync(aiFile, JSON.stringify({ error: String(e?.message || e) }, null, 2), 'utf8');
+              const aiRel = path.relative(path.join(__dirname, '..'), aiFile);
+              insertPayloadReconAi(payloadReconId, aiRel, process.env.GEMINI_MODEL || null, String(e?.message || e), new Date().toISOString());
+            } catch (err2) {
+              console.error('Failed to persist payload recon AI error:', err2);
+            }
+          }
+        });
       } catch (e) {
         console.error('Failed to persist payload recon result:', e);
       }
@@ -194,6 +225,70 @@ router.post('/payload/recon', async (req, res) => {
   } catch (err) {
     console.error('payload/recon failed:', err);
     res.status(500).json({ error: 'payload recon failed' });
+  }
+});
+
+router.post('/payload/analyze', async (req, res) => {
+  try {
+    const { entries, payload_recon_id: payloadReconId } = req.body || {};
+    const prId = Number(payloadReconId);
+
+    if (Number.isFinite(prId) && prId > 0) {
+      const existing = listPayloadReconAiByRecon(prId);
+      if (existing && existing.length) {
+        const latest = existing[0];
+        // If latest is success, never re-run.
+        // If latest is error, allow retry only when entries are provided.
+        if (!latest.error) {
+        try {
+          const baseDir = path.join(__dirname, '..', 'result');
+          const abs = path.resolve(path.join(__dirname, '..', latest.result_file));
+          if (!abs.startsWith(baseDir + path.sep) || !fs.existsSync(abs)) {
+            return res.status(404).json({ error: 'analysis file not found' });
+          }
+          const text = fs.readFileSync(abs, 'utf8');
+          const parsed = JSON.parse(text);
+          if (Array.isArray(parsed)) return res.status(200).json(parsed);
+          return res.status(500).json({ error: parsed?.error || latest.error || 'analysis failed' });
+        } catch (e) {
+          return res.status(500).json({ error: e?.message || 'failed to read analysis file' });
+        }
+        }
+      }
+    }
+
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'entries must be a non-empty array' });
+    }
+
+    const out = await analyzePayloadReconWithGemini(entries);
+
+    if (Number.isFinite(prId) && prId > 0) {
+      try {
+        // persist analysis next to the payload recon result (same target folder)
+        const pr = getPayloadReconById(prId);
+        const baseResultDir = path.join(__dirname, '..', 'result');
+        const prAbs = pr?.result_file
+          ? path.resolve(path.join(__dirname, '..', pr.result_file))
+          : null;
+        const targetDir =
+          prAbs && prAbs.startsWith(baseResultDir + path.sep)
+            ? path.dirname(prAbs)
+            : baseResultDir;
+
+        const aiFile = path.join(targetDir, `payload-recon-ai-${prId}-${Date.now()}.json`);
+        fs.writeFileSync(aiFile, JSON.stringify(out, null, 2), 'utf8');
+        const aiRel = path.relative(path.join(__dirname, '..'), aiFile);
+        insertPayloadReconAi(prId, aiRel, process.env.GEMINI_MODEL || null, null, new Date().toISOString());
+      } catch (e) {
+        console.error('Failed to persist payload analyze:', e);
+      }
+    }
+
+    return res.status(200).json(out);
+  } catch (err) {
+    console.error('payload/analyze failed:', err);
+    res.status(500).json({ error: err?.message || 'payload analyze failed' });
   }
 });
 

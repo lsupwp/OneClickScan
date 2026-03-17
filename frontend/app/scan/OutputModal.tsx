@@ -23,6 +23,7 @@ type OutputModalProps = {
   resultFile?: string | null;
   backend?: string;
   payloadEntries?: PayloadEntry[] | null;
+  payloadReconId?: number | null;
 };
 
 const TOOL_STYLE: Record<string, { bg: string; accent: string; label: string }> = {
@@ -42,6 +43,7 @@ export default function OutputModal({
   resultFile = null,
   backend = "",
   payloadEntries = null,
+  payloadReconId = null,
 }: OutputModalProps) {
   if (!open) return null;
 
@@ -84,7 +86,7 @@ export default function OutputModal({
         <div className="flex-1 overflow-y-auto p-6">
           {toolId === "katana" && <KatanaOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
           {toolId === "ffuf" && <FfufOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
-          {toolId === "payload_recon" && <PayloadReconOutput payloadEntries={payloadEntries} />}
+          {toolId === "payload_recon" && <PayloadReconOutput payloadEntries={payloadEntries} payloadReconId={payloadReconId} backend={backend} />}
         </div>
       </div>
     </div>

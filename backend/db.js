@@ -45,6 +45,16 @@ db.exec(`
     scan_at     DATETIME NOT NULL,
     FOREIGN KEY (target_id) REFERENCES target(target_id)
   );
+
+  CREATE TABLE IF NOT EXISTS payload_recon_ai (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    payload_recon_id INTEGER NOT NULL,
+    result_file      TEXT NOT NULL,
+    model            TEXT,
+    error            TEXT,
+    scan_at          DATETIME NOT NULL,
+    FOREIGN KEY (payload_recon_id) REFERENCES payload_recon(id)
+  );
 `);
 
 // lightweight migrations for older DBs
@@ -117,6 +127,23 @@ const listPayloadReconByTargetStmt = db.prepare(
    ORDER BY id DESC`
 );
 
+const getPayloadReconByIdStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at
+   FROM payload_recon
+   WHERE id = ?`
+);
+
+const insertPayloadReconAiStmt = db.prepare(
+  'INSERT INTO payload_recon_ai (payload_recon_id, result_file, model, error, scan_at) VALUES (?, ?, ?, ?, ?)'
+);
+
+const listPayloadReconAiByReconStmt = db.prepare(
+  `SELECT id, payload_recon_id, result_file, model, error, scan_at
+   FROM payload_recon_ai
+   WHERE payload_recon_id = ?
+   ORDER BY id DESC`
+);
+
 function getOrCreateTarget(targetName) {
   let row = getOrCreateTargetStmt.get(targetName);
   if (!row) {
@@ -173,6 +200,19 @@ function listPayloadReconByTarget(targetId) {
   return listPayloadReconByTargetStmt.all(targetId);
 }
 
+function getPayloadReconById(id) {
+  return getPayloadReconByIdStmt.get(id) || null;
+}
+
+function insertPayloadReconAi(payloadReconId, resultFile, model, error, scanAt) {
+  const info = insertPayloadReconAiStmt.run(payloadReconId, resultFile, model || null, error || null, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listPayloadReconAiByRecon(payloadReconId) {
+  return listPayloadReconAiByReconStmt.all(payloadReconId);
+}
+
 module.exports = {
   db,
   getOrCreateTarget,
@@ -186,5 +226,8 @@ module.exports = {
   getPayloadReconScanRound,
   insertPayloadRecon,
   listPayloadReconByTarget,
+  getPayloadReconById,
+  insertPayloadReconAi,
+  listPayloadReconAiByRecon,
 };
 

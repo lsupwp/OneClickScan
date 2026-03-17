@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect, useMemo, useRef, useState } from "react";
+
 type PayloadEntry = {
   found_in: string[];
   form_id?: string | null;
@@ -12,9 +14,88 @@ type PayloadEntry = {
 
 type PayloadReconOutputProps = {
   payloadEntries: PayloadEntry[] | null;
+  payloadReconId?: number | null;
+  backend?: string;
 };
 
-export default function PayloadReconOutput({ payloadEntries }: PayloadReconOutputProps) {
+type AnalyzeRec = {
+  action: string;
+  method: string;
+  tool: "sqlmap" | "xsstrike" | "curl";
+  risk: "Info" | "Low" | "Medium" | "High" | "Critical";
+  cmd: string;
+  what: string;
+  why: string;
+  notes?: string;
+};
+
+const RISK_ORDER: Record<AnalyzeRec["risk"], number> = {
+  Critical: 5,
+  High: 4,
+  Medium: 3,
+  Low: 2,
+  Info: 1,
+};
+
+function riskClass(risk: AnalyzeRec["risk"]) {
+  switch (risk) {
+    case "Critical":
+      return "bg-red-100 text-red-800 border-red-200";
+    case "High":
+      return "bg-orange-100 text-orange-800 border-orange-200";
+    case "Medium":
+      return "bg-amber-100 text-amber-800 border-amber-200";
+    case "Low":
+      return "bg-emerald-100 text-emerald-800 border-emerald-200";
+    default:
+      return "bg-zinc-100 text-zinc-700 border-zinc-200";
+  }
+}
+
+export default function PayloadReconOutput({ payloadEntries, payloadReconId = null, backend }: PayloadReconOutputProps) {
+  const resolvedBackend = useMemo(
+    () => backend || process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080",
+    [backend]
+  );
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [recs, setRecs] = useState<AnalyzeRec[] | null>(null);
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const autoRequestedRef = useRef(false);
+
+  const sortedRecs = useMemo(() => {
+    if (!recs) return null;
+    return [...recs].sort((a, b) => (RISK_ORDER[b.risk] ?? 0) - (RISK_ORDER[a.risk] ?? 0));
+  }, [recs]);
+
+  useEffect(() => {
+    if (!payloadEntries || payloadEntries.length === 0) return;
+    if (!payloadReconId) return;
+    if (recs) return;
+    if (analyzing) return;
+    if (autoRequestedRef.current) return;
+    autoRequestedRef.current = true;
+
+    (async () => {
+      setAnalyzing(true);
+      setAnalyzeError(null);
+      try {
+        const res = await fetch(`${resolvedBackend}/api/payload/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ payload_recon_id: payloadReconId, entries: payloadEntries }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error || "analyze failed");
+        setRecs(Array.isArray(data) ? (data as AnalyzeRec[]) : []);
+      } catch (e) {
+        setAnalyzeError((e as Error).message);
+      } finally {
+        setAnalyzing(false);
+      }
+    })();
+  }, [payloadEntries, payloadReconId, recs, analyzing, resolvedBackend]);
+
   if (payloadEntries === null) {
     return <p className="text-sm text-zinc-500">กำลังโหลด…</p>;
   }
@@ -23,7 +104,115 @@ export default function PayloadReconOutput({ payloadEntries }: PayloadReconOutpu
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">AI วิเคราะห์</p>
+          <p className="text-sm text-zinc-600">ให้ Gemini แนะนำเครื่องมือ + คำสั่งทดสอบ</p>
+        </div>
+        <button
+          type="button"
+          disabled={analyzing || !payloadEntries?.length}
+          onClick={async () => {
+            setAnalyzing(true);
+            setAnalyzeError(null);
+            setRecs(null);
+            try {
+              const res = await fetch(`${resolvedBackend}/api/payload/analyze`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ payload_recon_id: payloadReconId, entries: payloadEntries }),
+              });
+              const data = await res.json();
+              if (!res.ok) throw new Error(data?.error || "analyze failed");
+              setRecs(Array.isArray(data) ? (data as AnalyzeRec[]) : []);
+            } catch (e) {
+              setAnalyzeError((e as Error).message);
+            } finally {
+              setAnalyzing(false);
+            }
+          }}
+          className={`rounded-xl px-4 py-2 text-sm font-semibold shadow-sm transition ${
+            analyzing
+              ? "cursor-not-allowed bg-zinc-200 text-zinc-500"
+              : "bg-gradient-to-r from-violet-600 to-violet-700 text-white hover:from-violet-700 hover:to-violet-800"
+          }`}
+        >
+          {analyzing ? "กำลังวิเคราะห์..." : recs ? "วิเคราะห์แล้ว" : "AI วิเคราะห์"}
+        </button>
+      </div>
+
+      {analyzeError && (
+        <p className="text-sm text-red-600">{analyzeError}</p>
+      )}
+
+      {sortedRecs && (
+        <div className="space-y-3">
+          <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wider">
+            คำแนะนำจาก AI — {sortedRecs.length} รายการ
+          </p>
+          <div className="grid gap-3">
+            {sortedRecs.map((r, idx) => (
+              <div key={idx} className="rounded-2xl border border-zinc-200 bg-white p-4 shadow-sm">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={`rounded-lg border px-2.5 py-0.5 text-xs font-bold ${riskClass(r.risk)}`}>
+                    {r.risk}
+                  </span>
+                  <span className="rounded-lg bg-zinc-100 px-2.5 py-0.5 text-xs font-semibold text-zinc-700">
+                    {r.tool}
+                  </span>
+                  <span className="rounded-md bg-violet-100 px-2 py-0.5 text-xs font-semibold text-violet-800">
+                    {r.method}
+                  </span>
+                  <span className="font-mono text-xs text-zinc-600 break-all">{r.action}</span>
+                </div>
+                <p className="mt-2 text-sm text-zinc-700">
+                  <span className="font-semibold">ทดสอบอะไร:</span> {r.what}
+                </p>
+                <p className="mt-1 text-sm text-zinc-600">
+                  <span className="font-semibold">ทำไมเลือกเครื่องมือนี้:</span> {r.why}
+                </p>
+                {r.notes && (
+                  <p className="mt-1 text-xs text-zinc-500">{r.notes}</p>
+                )}
+                <div className="mt-3 rounded-xl bg-zinc-900 p-3 text-xs font-mono text-zinc-100 overflow-x-auto">
+                  {r.cmd || "—"}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={!r.cmd}
+                    onClick={async () => {
+                      if (!r.cmd) return;
+                      try {
+                        await navigator.clipboard.writeText(r.cmd);
+                        setCopiedIdx(idx);
+                        window.setTimeout(() => setCopiedIdx((cur) => (cur === idx ? null : cur)), 1200);
+                      } catch {}
+                    }}
+                    className={`rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                      r.cmd
+                        ? "cursor-pointer bg-zinc-900 text-white hover:bg-zinc-800 active:scale-[0.98] focus:outline-none focus:ring-2 focus:ring-violet-400/40"
+                        : "bg-zinc-200 text-zinc-500 cursor-not-allowed"
+                    }`}
+                  >
+                    {copiedIdx === idx ? "Copied!" : "Copy Command"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled
+                    className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-400 cursor-not-allowed"
+                    title="ยังไม่ได้ทำ Run Test ผ่าน backend"
+                  >
+                    Run Test
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {payloadEntries.map((entry, idx) => (
         <div key={idx} className="rounded-2xl border border-violet-100 bg-violet-50/30 p-4">
           <div className="flex items-center gap-2">
