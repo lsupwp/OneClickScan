@@ -79,6 +79,19 @@ db.exec(`
     scan_at     DATETIME NOT NULL,
     FOREIGN KEY (target_id) REFERENCES target(target_id)
   );
+
+  CREATE TABLE IF NOT EXISTS payload_tool_run (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    payload_recon_id INTEGER NOT NULL,
+    tool            TEXT NOT NULL,
+    cmd             TEXT NOT NULL,
+    output_file     TEXT NOT NULL,
+    status          TEXT NOT NULL, -- running|done|error
+    exit_code       INTEGER,
+    started_at      DATETIME NOT NULL,
+    finished_at     DATETIME,
+    FOREIGN KEY (payload_recon_id) REFERENCES payload_recon(id)
+  );
 `);
 
 // lightweight migrations for older DBs
@@ -152,9 +165,10 @@ const listPayloadReconByTargetStmt = db.prepare(
 );
 
 const getPayloadReconByIdStmt = db.prepare(
-  `SELECT id, target_id, result_file, scan_at
-   FROM payload_recon
-   WHERE id = ?`
+  `SELECT pr.id, pr.target_id, t.target_name, pr.result_file, pr.scan_at
+   FROM payload_recon pr
+   JOIN target t ON t.target_id = pr.target_id
+   WHERE pr.id = ?`
 );
 
 const insertPayloadReconAiStmt = db.prepare(
@@ -210,6 +224,24 @@ const listSubfinderByTargetStmt = db.prepare(
   `SELECT id, target_id, result_file, scan_at
    FROM subfinder
    WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
+const insertPayloadToolRunStmt = db.prepare(
+  `INSERT INTO payload_tool_run (payload_recon_id, tool, cmd, output_file, status, exit_code, started_at, finished_at)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+);
+
+const updatePayloadToolRunStmt = db.prepare(
+  `UPDATE payload_tool_run
+   SET status = ?, exit_code = ?, finished_at = ?
+   WHERE id = ?`
+);
+
+const listPayloadToolRunsByReconStmt = db.prepare(
+  `SELECT id, payload_recon_id, tool, cmd, output_file, status, exit_code, started_at, finished_at
+   FROM payload_tool_run
+   WHERE payload_recon_id = ?
    ORDER BY id DESC`
 );
 
@@ -324,6 +356,19 @@ function listSubfinderByTarget(targetId) {
   return listSubfinderByTargetStmt.all(targetId);
 }
 
+function insertPayloadToolRun(payloadReconId, tool, cmd, outputFile, status, exitCode, startedAt, finishedAt) {
+  const info = insertPayloadToolRunStmt.run(payloadReconId, tool, cmd, outputFile, status, exitCode ?? null, startedAt, finishedAt ?? null);
+  return info.lastInsertRowid;
+}
+
+function updatePayloadToolRun(runId, status, exitCode, finishedAt) {
+  updatePayloadToolRunStmt.run(status, exitCode ?? null, finishedAt ?? null, runId);
+}
+
+function listPayloadToolRunsByRecon(payloadReconId) {
+  return listPayloadToolRunsByReconStmt.all(payloadReconId);
+}
+
 module.exports = {
   db,
   getOrCreateTarget,
@@ -349,5 +394,8 @@ module.exports = {
   getSubfinderScanRound,
   insertSubfinderScan,
   listSubfinderByTarget,
+  insertPayloadToolRun,
+  updatePayloadToolRun,
+  listPayloadToolRunsByRecon,
 };
 

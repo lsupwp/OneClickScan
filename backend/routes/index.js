@@ -13,6 +13,7 @@ const { analyzePayloadReconWithGemini } = require('../services/payload-analyze')
 const { startNucleiScan } = require('../services/nuclei');
 const { startWhatwebScan } = require('../services/whatweb');
 const { startSubfinderScan } = require('../services/subfinder');
+const { startPayloadToolRun } = require('../services/payload-run');
 const {
   listTargets,
   listKatanaByTarget,
@@ -27,6 +28,7 @@ const {
   getPayloadReconById,
   insertPayloadReconAi,
   listPayloadReconAiByRecon,
+  listPayloadToolRunsByRecon,
 } = require('../db');
 
 const router = express.Router();
@@ -370,6 +372,34 @@ router.post('/payload/analyze', async (req, res) => {
   }
 });
 
+router.get('/payload/runs', (req, res) => {
+  const prId = Number(req.query.payload_recon_id);
+  if (!Number.isFinite(prId)) return res.status(400).json({ error: 'payload_recon_id is required' });
+  res.status(200).json(listPayloadToolRunsByRecon(prId));
+});
+
+router.post('/payload/run', async (req, res) => {
+  const { payload_recon_id: payloadReconId, cmd } = req.body || {};
+  const prId = Number(payloadReconId);
+  if (!Number.isFinite(prId)) {
+    return res.status(400).json({ error: 'payload_recon_id is required' });
+  }
+  if (!cmd || typeof cmd !== 'string') {
+    return res.status(400).json({ error: 'cmd is required' });
+  }
+
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+
+  try {
+    const { runId, outputFile, tool } = await startPayloadToolRun({ payloadReconId: prId, jobId, cmd });
+    res.status(202).json({ jobId, runId, outputFile, tool });
+  } catch (err) {
+    console.error('Failed to start payload run:', err);
+    res.status(500).json({ error: err?.message || 'Failed to start payload run' });
+  }
+});
+
 router.get('/result', (req, res) => {
   const rel = typeof req.query.path === 'string' ? req.query.path : '';
   if (!rel) return res.status(400).json({ error: 'path is required' });
@@ -387,7 +417,8 @@ router.get('/result', (req, res) => {
 
   try {
     const text = fs.readFileSync(abs, 'utf8');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    const ext = path.extname(abs).toLowerCase();
+    res.setHeader('Content-Type', ext === '.json' ? 'application/json; charset=utf-8' : 'text/plain; charset=utf-8');
     res.status(200).send(text);
   } catch (err) {
     console.error('Failed to read result file:', err);

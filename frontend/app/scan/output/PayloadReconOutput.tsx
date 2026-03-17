@@ -29,6 +29,18 @@ type AnalyzeRec = {
   notes?: string;
 };
 
+type PayloadRunRow = {
+  id: number;
+  payload_recon_id: number;
+  tool: string;
+  cmd: string;
+  output_file: string;
+  status: "running" | "done" | "error";
+  exit_code: number | null;
+  started_at: string;
+  finished_at: string | null;
+};
+
 const RISK_ORDER: Record<AnalyzeRec["risk"], number> = {
   Critical: 5,
   High: 4,
@@ -63,6 +75,28 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const autoRequestedRef = useRef(false);
   const lastReconIdRef = useRef<number | null>(null);
+  const [runs, setRuns] = useState<PayloadRunRow[] | null>(null);
+  const [runningIdx, setRunningIdx] = useState<number | null>(null);
+  const [runLogsByIdx, setRunLogsByIdx] = useState<Record<number, string[]>>({});
+  const [runOutFileByIdx, setRunOutFileByIdx] = useState<Record<number, string>>({});
+  const [runTextByIdx, setRunTextByIdx] = useState<Record<number, string>>({});
+  const wsRef = useRef<WebSocket | null>(null);
+
+  const wsUrl = useMemo(() => {
+    const fallback = "ws://127.0.0.1:8080";
+    const b = String(resolvedBackend || "").trim();
+    if (!b) return fallback;
+    try {
+      const u = new URL(b);
+      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+      return u.toString();
+    } catch {
+      if (b.startsWith("wss://") || b.startsWith("ws://")) return b;
+      if (b.startsWith("https://")) return b.replace("https://", "wss://");
+      if (b.startsWith("http://")) return b.replace("http://", "ws://");
+      return fallback;
+    }
+  }, [resolvedBackend]);
 
   const sortedRecs = useMemo(() => {
     if (!recs) return null;
@@ -76,8 +110,27 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
       autoRequestedRef.current = false;
       setAnalyzeError(null);
       setRecs(null);
+      setRuns(null);
+      setRunningIdx(null);
+      setRunLogsByIdx({});
+      setRunOutFileByIdx({});
+      setRunTextByIdx({});
     }
   }, [payloadReconId]);
+
+  useEffect(() => {
+    if (!payloadReconId) return;
+    fetch(`${resolvedBackend}/api/payload/runs?payload_recon_id=${encodeURIComponent(String(payloadReconId))}`, { cache: "no-store" })
+      .then((r) => r.json())
+      .then((data) => setRuns(Array.isArray(data) ? (data as PayloadRunRow[]) : []))
+      .catch(() => setRuns([]));
+  }, [payloadReconId, resolvedBackend]);
+
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+    };
+  }, []);
 
   useEffect(() => {
     if (!payloadReconId) return;
@@ -204,6 +257,26 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
                 <div className="mt-3 rounded-xl bg-zinc-900 p-3 text-xs font-mono text-zinc-100 overflow-x-auto">
                   {r.cmd || "—"}
                 </div>
+                {runLogsByIdx[idx]?.length ? (
+                  <details className="mt-3 rounded-xl border border-zinc-200 bg-white/60">
+                    <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/60">
+                      Log ระหว่างรัน ({runLogsByIdx[idx].length})
+                    </summary>
+                    <pre className="border-t border-zinc-200 p-3 text-xs font-mono text-zinc-900 max-h-64 overflow-auto whitespace-pre-wrap break-all">
+                      {runLogsByIdx[idx].join("")}
+                    </pre>
+                  </details>
+                ) : null}
+                {runOutFileByIdx[idx] && runTextByIdx[idx] ? (
+                  <details className="mt-3 rounded-xl border border-zinc-200 bg-white/60">
+                    <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/60">
+                      Output (.txt)
+                    </summary>
+                    <pre className="border-t border-zinc-200 p-3 text-xs font-mono text-zinc-900 max-h-80 overflow-auto whitespace-pre-wrap break-all">
+                      {runTextByIdx[idx]}
+                    </pre>
+                  </details>
+                ) : null}
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
@@ -226,13 +299,79 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
                   </button>
                   <button
                     type="button"
-                    disabled
-                    className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-400 cursor-not-allowed"
-                    title="ยังไม่ได้ทำ Run Test ผ่าน backend"
+                    disabled={!payloadReconId || !r.cmd || analyzing || runningIdx === idx}
+                    onClick={async () => {
+                      if (!payloadReconId || !r.cmd) return;
+                      setRunningIdx(idx);
+                      setRunLogsByIdx((p) => ({ ...p, [idx]: [] }));
+                      try {
+                        wsRef.current?.close();
+                        const ws = new WebSocket(wsUrl);
+                        wsRef.current = ws;
+
+                        const start = async () => {
+                          const res = await fetch(`${resolvedBackend}/api/payload/run`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ payload_recon_id: payloadReconId, cmd: r.cmd }),
+                          });
+                          const data = (await res.json()) as { jobId?: string; runId?: number; outputFile?: string; error?: string };
+                          if (!data.jobId) throw new Error(data.error || "start run failed");
+                          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+                          if (data.outputFile) setRunOutFileByIdx((p) => ({ ...p, [idx]: data.outputFile! }));
+                        };
+
+                        ws.onmessage = (ev) => {
+                          try {
+                            const msg = JSON.parse(ev.data as string);
+                            if (msg.type === "progress" && typeof msg.message === "string") {
+                              setRunLogsByIdx((p) => ({ ...p, [idx]: [...(p[idx] || []), msg.message] }));
+                            }
+                            if (msg.type === "done" && msg.outputFile) {
+                              const pth = String(msg.outputFile);
+                              setRunOutFileByIdx((p) => ({ ...p, [idx]: pth }));
+                              fetch(`${resolvedBackend}/api/result?path=${encodeURIComponent(pth)}`, { cache: "no-store" })
+                                .then((rr) => rr.text())
+                                .then((txt) => setRunTextByIdx((p) => ({ ...p, [idx]: txt })))
+                                .catch(() => {});
+                              fetch(`${resolvedBackend}/api/payload/runs?payload_recon_id=${encodeURIComponent(String(payloadReconId))}`, { cache: "no-store" })
+                                .then((rr) => rr.json())
+                                .then((d) => setRuns(Array.isArray(d) ? (d as PayloadRunRow[]) : []))
+                                .catch(() => {});
+                              setRunningIdx((cur) => (cur === idx ? null : cur));
+                            }
+                            if (msg.type === "error") {
+                              if (msg.outputFile) {
+                                const pth = String(msg.outputFile);
+                                setRunOutFileByIdx((p) => ({ ...p, [idx]: pth }));
+                                fetch(`${resolvedBackend}/api/result?path=${encodeURIComponent(pth)}`, { cache: "no-store" })
+                                  .then((rr) => rr.text())
+                                  .then((txt) => setRunTextByIdx((p) => ({ ...p, [idx]: txt })))
+                                  .catch(() => {});
+                              }
+                              setRunningIdx((cur) => (cur === idx ? null : cur));
+                            }
+                          } catch {}
+                        };
+                        ws.onopen = () => void start();
+                        ws.onerror = () => setRunningIdx((cur) => (cur === idx ? null : cur));
+                      } catch (e) {
+                        setAnalyzeError((e as Error).message);
+                        setRunningIdx(null);
+                      }
+                    }}
+                    className={`rounded-lg px-3 py-2 text-xs font-semibold transition ${
+                      !payloadReconId || !r.cmd || analyzing || runningIdx === idx
+                        ? "bg-zinc-200 text-zinc-500 cursor-not-allowed"
+                        : "bg-white border border-zinc-200 text-zinc-800 hover:bg-zinc-50 active:scale-[0.98]"
+                    }`}
                   >
-                    Run Test
+                    {runningIdx === idx ? "Running..." : "Run Test"}
                   </button>
                 </div>
+                {runs && runs.some((x) => x.cmd === r.cmd && x.status === "done") && (
+                  <p className="mt-2 text-[11px] text-emerald-700 font-semibold">สถานะ: เคยรันแล้ว</p>
+                )}
               </div>
             ))}
           </div>
