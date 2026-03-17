@@ -18,7 +18,7 @@ const WS_URL = () => {
   return b.replace("http://", "ws://");
 };
 
-type ToolId = "katana" | "ffuf" | "payload_recon";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
 type JobPhase = "idle" | "starting" | "processing" | "scoring" | "done" | "error";
 
 type KatanaFlagDef = {
@@ -55,6 +55,7 @@ export default function ScanClient() {
     katana: false,
     ffuf: false,
     payload_recon: false,
+    nuclei: false,
   });
 
   const [errorModalMessage, setErrorModalMessage] = useState<string | null>(null);
@@ -89,17 +90,25 @@ export default function ScanClient() {
   const [ffufResultFile, setFfufResultFile] = useState<string | null>(null);
   const [ffufLogs, setFfufLogs] = useState<string[]>([]);
 
+  // Nuclei job state
+  const [nucleiPhase, setNucleiPhase] = useState<JobPhase>("idle");
+  const [nucleiStatus, setNucleiStatus] = useState("");
+  const [nucleiJobId, setNucleiJobId] = useState<string | null>(null);
+  const [nucleiResultFile, setNucleiResultFile] = useState<string | null>(null);
+  const [nucleiLogs, setNucleiLogs] = useState<string[]>([]);
+
   const [payloadPhase, setPayloadPhase] = useState<"idle" | "running" | "done" | "error">("idle");
   const [payloadEntries, setPayloadEntries] = useState<PayloadEntry[] | null>(null);
   const [payloadResultFile, setPayloadResultFile] = useState<string | null>(null);
   const [payloadReconId, setPayloadReconId] = useState<number | null>(null);
 
   const [configModalTool, setConfigModalTool] = useState<null | ToolId>(null);
-  const [outputModalTool, setOutputModalTool] = useState<null | "katana" | "ffuf" | "payload_recon">(null);
+  const [outputModalTool, setOutputModalTool] = useState<null | "katana" | "ffuf" | "payload_recon" | "nuclei">(null);
   const [loadPreviousOpen, setLoadPreviousOpen] = useState(false);
 
   const katanaWsRef = useRef<WebSocket | null>(null);
   const ffufWsRef = useRef<WebSocket | null>(null);
+  const nucleiWsRef = useRef<WebSocket | null>(null);
   const payloadReconStartedRef = useRef(false);
 
   const anyRunning =
@@ -109,6 +118,9 @@ export default function ScanClient() {
     ffufPhase === "starting" ||
     ffufPhase === "processing" ||
     ffufPhase === "scoring" ||
+    nucleiPhase === "starting" ||
+    nucleiPhase === "processing" ||
+    nucleiPhase === "scoring" ||
     payloadPhase === "running";
 
   useEffect(() => {
@@ -149,8 +161,53 @@ export default function ScanClient() {
     return () => {
       katanaWsRef.current?.close();
       ffufWsRef.current?.close();
+      nucleiWsRef.current?.close();
     };
   }, []);
+
+  // Fallback: if nuclei finished but WS "done" was missed (server restart, etc.),
+  // periodically check latest nuclei result for this target and update UI to Done.
+  useEffect(() => {
+    if (!selectedTools.nuclei) return;
+    const running =
+      nucleiPhase === "starting" || nucleiPhase === "processing" || nucleiPhase === "scoring";
+    if (!running) return;
+    if (nucleiResultFile) return;
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const norm = normalizeUrlForLookup(targetUrl);
+        if (!norm) return;
+        const tRes = await fetch(`${backend}/api/targets?q=${encodeURIComponent(norm)}&limit=20`, { cache: "no-store" });
+        if (!tRes.ok) return;
+        const targets = (await tRes.json()) as { target_id: number; target_name: string }[];
+        const exact = (targets || []).find((t) => normalizeUrlForLookup(t.target_name) === norm);
+        if (!exact) return;
+        const sRes = await fetch(`${backend}/api/targets/${exact.target_id}/nuclei`, { cache: "no-store" });
+        if (!sRes.ok) return;
+        const scans = (await sRes.json()) as { result_file: string; scan_at: string }[];
+        const latest = scans?.[0];
+        if (!latest?.result_file) return;
+        if (cancelled) return;
+        setNucleiPhase("done");
+        setNucleiStatus("Done. Loaded latest result");
+        setNucleiResultFile(latest.result_file);
+      } catch {
+        // ignore
+      }
+    };
+
+    // quick retry loop, then stop (avoid infinite polling)
+    const id = window.setInterval(() => void tick(), 3500);
+    void tick();
+    const stop = window.setTimeout(() => window.clearInterval(id), 25000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      window.clearTimeout(stop);
+    };
+  }, [selectedTools.nuclei, nucleiPhase, nucleiResultFile, backend, targetUrl]);
 
   const toggleTool = useCallback((id: ToolId) => {
     setSelectedTools((prev) => {
@@ -262,8 +319,9 @@ export default function ScanClient() {
     }
     const runKatana = selectedTools.katana;
     const runFfuf = selectedTools.ffuf;
-    if (!runKatana && !runFfuf) {
-      setErrorModalMessage("กรุณาเลือกอย่างน้อย 1 tool (Katana หรือ FFuf)");
+    const runNuclei = selectedTools.nuclei;
+    if (!runKatana && !runFfuf && !runNuclei) {
+      setErrorModalMessage("กรุณาเลือกอย่างน้อย 1 tool");
       return;
     }
     startRun();
@@ -273,6 +331,7 @@ export default function ScanClient() {
     // Skip tools that are already Done (e.g. loaded from previous scans)
     const runKatana = selectedTools.katana && katanaPhase !== "done";
     const runFfuf = selectedTools.ffuf && ffufPhase !== "done";
+    const runNuclei = selectedTools.nuclei && nucleiPhase !== "done";
     if (runFfuf && ffufWordlistMode === "upload" && !ffufUploadedFileId) {
       setErrorModalMessage("กรุณาอัปโหลด wordlist (.txt) สำหรับ FFuf ก่อน");
       return;
@@ -399,6 +458,57 @@ export default function ScanClient() {
       };
     }
 
+    if (runNuclei) {
+      setNucleiPhase("starting");
+      setNucleiStatus("Connecting...");
+      nucleiWsRef.current?.close();
+      const ws = new WebSocket(wsUrl);
+      nucleiWsRef.current = ws;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "status") {
+            setNucleiPhase(msg.status === "starting" || msg.status === "processing" || msg.status === "scoring" ? msg.status : "starting");
+            if (msg.message) setNucleiStatus(msg.message);
+          } else if (msg.type === "progress" && msg.message?.trim()) {
+            setNucleiLogs((prev) => [...prev, msg.message.trimEnd()]);
+          } else if (msg.type === "done") {
+            setNucleiPhase("done");
+            setNucleiStatus(`Done. ${msg.totalFindings ?? "?"} findings`);
+            if (msg.resultFile) setNucleiResultFile(msg.resultFile);
+          } else if (msg.type === "error") {
+            setNucleiPhase("error");
+            setNucleiStatus(msg.message);
+          }
+        } catch {}
+      };
+      ws.onopen = async () => {
+        try {
+          const res = await fetch(`${backend}/api/scan/nuclei`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_url: targetUrl.trim() }),
+          });
+          const data = (await res.json()) as { jobId?: string; error?: string };
+          if (!data.jobId) {
+            setNucleiPhase("error");
+            setNucleiStatus(data.error || "Failed to start");
+            return;
+          }
+          setNucleiJobId(data.jobId);
+          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+          setNucleiStatus("Subscribed. Running...");
+        } catch (e) {
+          setNucleiPhase("error");
+          setNucleiStatus((e as Error).message);
+        }
+      };
+      ws.onerror = () => {
+        setNucleiPhase("error");
+        setNucleiStatus("WebSocket error");
+      };
+    }
+
   }
 
   function resetKatanaForRescan() {
@@ -430,7 +540,7 @@ export default function ScanClient() {
   function resetAllRound() {
     resetKatanaForRescan();
     resetFfufForRescan();
-    setSelectedTools({ katana: false, ffuf: false, payload_recon: false });
+    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false });
     setOutputModalTool(null);
     setConfigModalTool(null);
   }
@@ -544,6 +654,7 @@ export default function ScanClient() {
                 { id: "katana" as const, label: "Katana Scan", desc: "Crawl + Gemini score" },
                 { id: "ffuf" as const, label: "FFuf Hidden Path", desc: "Wordlist + Gemini score" },
                 { id: "payload_recon" as const, label: "Payload Recon", desc: "รันหลัง Katana/FFuf" },
+                { id: "nuclei" as const, label: "Nuclei", desc: "Templates scan (filtered JSON output)" },
               ] as const
             ).map(({ id, label, desc }) => (
               <label
@@ -686,9 +797,31 @@ export default function ScanClient() {
                 }
               />
             )}
+            {selectedTools.nuclei && (
+              <ToolCard
+                label="Nuclei"
+                phase={nucleiPhase}
+                status={nucleiStatus}
+                configSummary="jsonl → filtered JSON"
+                onClick={() => {
+                  if (nucleiPhase === "idle") setConfigModalTool("nuclei");
+                  else setOutputModalTool("nuclei");
+                }}
+                canClickOutput={nucleiPhase === "done" || nucleiPhase === "error"}
+                isRunning={nucleiPhase === "starting" || nucleiPhase === "processing" || nucleiPhase === "scoring"}
+                clickable={true}
+                onRescan={nucleiPhase === "done" || nucleiPhase === "error" ? () => {
+                  setNucleiPhase("idle");
+                  setNucleiStatus("");
+                  setNucleiJobId(null);
+                  setNucleiResultFile(null);
+                  setNucleiLogs([]);
+                } : undefined}
+              />
+            )}
           </div>
 
-          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && (
+          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && (
             <div className="rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 p-12 text-center">
               <p className="text-sm font-medium text-zinc-500">เลือก tools ด้านซ้าย จะเปิด modal ตั้งค่าของ tool นั้น แล้วกด Run เพื่อเริ่มสแกน</p>
             </div>
@@ -730,18 +863,21 @@ export default function ScanClient() {
         open={outputModalTool !== null}
         onClose={() => setOutputModalTool(null)}
         toolId={outputModalTool ?? "katana"}
+        title={outputModalTool ?? "Katana"}
         phase={
           outputModalTool === "katana"
             ? (katanaPhase === "starting" || katanaPhase === "processing" || katanaPhase === "scoring" ? "running" : katanaPhase === "error" ? "error" : "done")
             : outputModalTool === "ffuf"
               ? (ffufPhase === "starting" || ffufPhase === "processing" || ffufPhase === "scoring" ? "running" : ffufPhase === "error" ? "error" : "done")
+              : outputModalTool === "nuclei"
+                ? (nucleiPhase === "starting" || nucleiPhase === "processing" || nucleiPhase === "scoring" ? "running" : nucleiPhase === "error" ? "error" : "done")
               : payloadPhase === "error"
                 ? "error"
                 : "done"
         }
-        status={outputModalTool === "katana" ? katanaStatus : outputModalTool === "ffuf" ? ffufStatus : payloadPhase === "done" ? `พบ ${payloadEntries?.length ?? 0} รายการ` : "เกิดข้อผิดพลาด"}
-        logs={outputModalTool === "katana" ? katanaLogs : outputModalTool === "ffuf" ? ffufLogs : undefined}
-        resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : null}
+        status={outputModalTool === "katana" ? katanaStatus : outputModalTool === "ffuf" ? ffufStatus : outputModalTool === "nuclei" ? nucleiStatus : payloadPhase === "done" ? `พบ ${payloadEntries?.length ?? 0} รายการ` : "เกิดข้อผิดพลาด"}
+        logs={outputModalTool === "katana" ? katanaLogs : outputModalTool === "ffuf" ? ffufLogs : outputModalTool === "nuclei" ? nucleiLogs : undefined}
+        resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : outputModalTool === "nuclei" ? nucleiResultFile : null}
         backend={backend}
         payloadEntries={outputModalTool === "payload_recon" ? payloadEntries : undefined}
         payloadReconId={outputModalTool === "payload_recon" ? payloadReconId : null}
@@ -788,6 +924,14 @@ export default function ScanClient() {
                 else setPayloadEntries([]);
               })
               .catch(() => setPayloadEntries([]));
+          }
+          if (sel.nuclei) {
+            setSelectedTools((prev) => ({ ...prev, nuclei: true }));
+            setNucleiPhase("done");
+            setNucleiStatus("Loaded previous scan");
+            setNucleiJobId(null);
+            setNucleiResultFile(sel.nuclei.result_file);
+            setNucleiLogs([]);
           }
           payloadReconStartedRef.current = false;
           if (!sel.payload_recon) {
@@ -887,4 +1031,17 @@ function ToolCard({
       </p>
     </div>
   );
+}
+
+function normalizeUrlForLookup(raw: string): string {
+  const v = (raw || "").trim();
+  if (!v) return "";
+  try {
+    const u = new URL(v);
+    u.hash = "";
+    const s = u.toString();
+    return s.endsWith("/") ? s : s + "/";
+  } catch {
+    return v.endsWith("/") ? v : v + "/";
+  }
 }

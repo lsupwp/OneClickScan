@@ -3,6 +3,7 @@
 import KatanaOutput from "./output/KatanaOutput";
 import FfufOutput from "./output/FfufOutput";
 import PayloadReconOutput from "./output/PayloadReconOutput";
+import NucleiOutput from "./output/NucleiOutput";
 
 export type PayloadEntry = {
   found_in: string[];
@@ -15,7 +16,7 @@ export type PayloadEntry = {
 type OutputModalProps = {
   open: boolean;
   onClose: () => void;
-  toolId: "katana" | "ffuf" | "payload_recon";
+  toolId: "katana" | "ffuf" | "payload_recon" | "nuclei";
   title: string;
   phase: "running" | "done" | "error";
   status: string;
@@ -30,6 +31,7 @@ const TOOL_STYLE: Record<string, { bg: string; accent: string; label: string }> 
   katana: { bg: "bg-amber-50", accent: "text-amber-700", label: "Katana" },
   ffuf: { bg: "bg-sky-50", accent: "text-sky-700", label: "FFuf" },
   payload_recon: { bg: "bg-violet-50", accent: "text-violet-700", label: "Payload Recon" },
+  nuclei: { bg: "bg-zinc-50", accent: "text-zinc-800", label: "Nuclei" },
 };
 
 export default function OutputModal({
@@ -87,6 +89,7 @@ export default function OutputModal({
           {toolId === "katana" && <KatanaOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
           {toolId === "ffuf" && <FfufOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
           {toolId === "payload_recon" && <PayloadReconOutput payloadEntries={payloadEntries} payloadReconId={payloadReconId} backend={backend} />}
+          {toolId === "nuclei" && <NucleiOutput phase={phase} logs={logs} resultFile={resultFile} backend={backend} />}
         </div>
       </div>
     </div>

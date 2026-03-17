@@ -2,7 +2,7 @@
 
 import { useRef } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
 type KatanaFlagDef = {
   name: string;
   label: string;
@@ -82,7 +82,15 @@ export default function ConfigModal({
   };
 
   const title = tool === "katana" ? "Katana" : tool === "ffuf" ? "FFuf" : "Payload Recon";
-  const subtitle = tool === "katana" ? "ตั้งค่า flags สำหรับ crawl" : tool === "ffuf" ? "ตั้งค่า wordlist และ options" : "รันหลัง Katana/FFuf เสร็จ";
+  const title2 = tool === "katana" ? "Katana" : tool === "ffuf" ? "FFuf" : tool === "nuclei" ? "Nuclei" : "Payload Recon";
+  const subtitle =
+    tool === "katana"
+      ? "ตั้งค่า flags สำหรับ crawl"
+      : tool === "ffuf"
+        ? "ตั้งค่า wordlist และ options"
+        : tool === "nuclei"
+          ? "สแกนด้วย templates และเก็บผลแบบ filtered JSON"
+          : "รันหลัง Katana/FFuf เสร็จ";
 
   return (
     <div
@@ -97,7 +105,7 @@ export default function ConfigModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="border-b border-zinc-100 bg-gradient-to-r from-slate-50 to-zinc-50 px-6 py-4">
-          <h2 className="text-lg font-semibold text-zinc-900">ตั้งค่า {title}</h2>
+          <h2 className="text-lg font-semibold text-zinc-900">ตั้งค่า {title2}</h2>
           <p className="mt-0.5 text-sm text-zinc-500">{subtitle}</p>
         </div>
 
@@ -212,6 +220,19 @@ export default function ConfigModal({
                 Payload Recon
               </h3>
               <p className="mt-2 text-xs text-zinc-600">จะรันอัตโนมัติหลัง Katana / FFuf เสร็จ โดยใช้ผลจากรอบนี้</p>
+            </section>
+          )}
+
+          {tool === "nuclei" && (
+            <section className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4">
+              <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">N</span>
+                Nuclei
+              </h3>
+              <p className="mt-2 text-xs text-zinc-600">
+                รัน nuclei ใน container แล้วแปลง output JSONL ให้เหลือ fields สำคัญ:{" "}
+                <span className="font-mono">name,severity,matchedAt,templateId,description,cve</span>
+              </p>
             </section>
           )}
         </div>

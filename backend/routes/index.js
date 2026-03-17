@@ -10,10 +10,12 @@ const {
 } = require('../services/ffuf-hidden-path');
 const { runPayloadRecon } = require('../services/payload-recon');
 const { analyzePayloadReconWithGemini } = require('../services/payload-analyze');
+const { startNucleiScan } = require('../services/nuclei');
 const {
   listTargets,
   listKatanaByTarget,
   listFfufByTarget,
+  listNucleiByTarget,
   getOrCreateTarget,
   getPayloadReconScanRound,
   insertPayloadRecon,
@@ -105,12 +107,36 @@ router.get('/targets/:targetId/ffuf', (req, res) => {
   res.status(200).json(listFfufByTarget(targetId));
 });
 
+router.get('/targets/:targetId/nuclei', (req, res) => {
+  const targetId = Number(req.params.targetId);
+  if (!Number.isFinite(targetId)) {
+    return res.status(400).json({ error: 'invalid targetId' });
+  }
+  res.status(200).json(listNucleiByTarget(targetId));
+});
+
 router.get('/targets/:targetId/payload-recon', (req, res) => {
   const targetId = Number(req.params.targetId);
   if (!Number.isFinite(targetId)) {
     return res.status(400).json({ error: 'invalid targetId' });
   }
   res.status(200).json(listPayloadReconByTarget(targetId));
+});
+
+router.post('/scan/nuclei', async (req, res) => {
+  const { target_url: targetUrl } = req.body || {};
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).json({ error: 'target_url is required' });
+  }
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  try {
+    await startNucleiScan({ targetUrl, jobId });
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('Failed to start nuclei scan:', err);
+    res.status(500).json({ error: 'Failed to start nuclei scan' });
+  }
 });
 
 router.post('/upload/wordlist', (req, res, next) => {

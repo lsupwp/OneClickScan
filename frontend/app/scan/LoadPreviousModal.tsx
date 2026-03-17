@@ -2,17 +2,19 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
 
 type TargetRow = { target_id: number; target_name: string };
 type KatanaScanRow = { id: number; target_id: number; result_file: string; flags_json?: string | null; scan_at: string };
 type FfufScanRow = { id: number; target_id: number; result_file: string; wordlist_source?: string | null; scan_at: string };
 type PayloadReconScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
+type NucleiScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
 
 type LoadPreviousSelection = {
   katana?: KatanaScanRow | null;
   ffuf?: FfufScanRow | null;
   payload_recon?: PayloadReconScanRow | null;
+  nuclei?: NucleiScanRow | null;
 };
 
 export default function LoadPreviousModal({
@@ -35,7 +37,8 @@ export default function LoadPreviousModal({
   const [katanaScans, setKatanaScans] = useState<KatanaScanRow[]>([]);
   const [ffufScans, setFfufScans] = useState<FfufScanRow[]>([]);
   const [payloadScans, setPayloadScans] = useState<PayloadReconScanRow[]>([]);
-  const [pick, setPick] = useState<LoadPreviousSelection>({ katana: null, ffuf: null, payload_recon: null });
+  const [nucleiScans, setNucleiScans] = useState<NucleiScanRow[]>([]);
+  const [pick, setPick] = useState<LoadPreviousSelection>({ katana: null, ffuf: null, payload_recon: null, nuclei: null });
 
   const normalizedUrl = useMemo(() => normalizeUrl(targetUrl), [targetUrl]);
 
@@ -46,7 +49,8 @@ export default function LoadPreviousModal({
     setKatanaScans([]);
     setFfufScans([]);
     setPayloadScans([]);
-    setPick({ katana: null, ffuf: null, payload_recon: null });
+    setNucleiScans([]);
+    setPick({ katana: null, ffuf: null, payload_recon: null, nuclei: null });
 
     const url = normalizedUrl;
     if (!url) {
@@ -69,18 +73,21 @@ export default function LoadPreviousModal({
         }
         setTarget(exact);
 
-        const [kRes, fRes, pRes] = await Promise.all([
+        const [kRes, fRes, pRes, nRes] = await Promise.all([
           fetch(`${backend}/api/targets/${exact.target_id}/katana`, { cache: "no-store" }),
           fetch(`${backend}/api/targets/${exact.target_id}/ffuf`, { cache: "no-store" }),
           fetch(`${backend}/api/targets/${exact.target_id}/payload-recon`, { cache: "no-store" }),
+          fetch(`${backend}/api/targets/${exact.target_id}/nuclei`, { cache: "no-store" }),
         ]);
         const kData = (await kRes.json()) as KatanaScanRow[];
         const fData = (await fRes.json()) as FfufScanRow[];
         const pData = (await pRes.json()) as PayloadReconScanRow[];
+        const nData = (await nRes.json()) as NucleiScanRow[];
         if (cancelled) return;
         setKatanaScans(Array.isArray(kData) ? kData.slice(0, 10) : []);
         setFfufScans(Array.isArray(fData) ? fData.slice(0, 10) : []);
         setPayloadScans(Array.isArray(pData) ? pData.slice(0, 10) : []);
+        setNucleiScans(Array.isArray(nData) ? nData.slice(0, 10) : []);
         setLoading(false);
       } catch (e) {
         if (!cancelled) {
@@ -100,7 +107,7 @@ export default function LoadPreviousModal({
     if (e.target === overlayRef.current) onClose();
   };
 
-  const hasAny = katanaScans.length > 0 || ffufScans.length > 0 || payloadScans.length > 0;
+  const hasAny = katanaScans.length > 0 || ffufScans.length > 0 || payloadScans.length > 0 || nucleiScans.length > 0;
 
   return (
     <div
@@ -329,6 +336,66 @@ export default function LoadPreviousModal({
                 )}
               </section>
 
+              <section className="rounded-2xl border border-zinc-200 bg-zinc-50/40 p-4">
+                <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">N</span>
+                  Nuclei
+                </h3>
+                {nucleiScans.length === 0 ? (
+                  <p className="mt-2 text-sm text-zinc-500">ยังไม่มีประวัติ Nuclei</p>
+                ) : (
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white p-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-zinc-800">
+                          {pick.nuclei ? `Scan #${pick.nuclei.id}` : "ยังไม่ได้เลือก"}
+                        </p>
+                        <p className="mt-0.5 text-xs text-zinc-500 truncate">
+                          {pick.nuclei ? `${new Date(pick.nuclei.scan_at).toLocaleString()} • ${pick.nuclei.result_file}` : "—"}
+                        </p>
+                      </div>
+                      <select
+                        value={pick.nuclei?.id ?? ""}
+                        onChange={(e) => {
+                          const id = Number(e.target.value);
+                          const row = nucleiScans.find((x) => x.id === id) || null;
+                          setPick((p) => ({ ...p, nuclei: row }));
+                        }}
+                        className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                      >
+                        <option value="">เลือกสแกน…</option>
+                        {nucleiScans.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            #{s.id} • {new Date(s.scan_at).toLocaleString()}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <details className="rounded-xl border border-zinc-200 bg-white/60">
+                      <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/60">
+                        ดูรายการทั้งหมด ({nucleiScans.length})
+                      </summary>
+                      <div className="border-t border-zinc-200 p-2 max-h-48 overflow-auto">
+                        {nucleiScans.map((s) => (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={() => setPick((p) => ({ ...p, nuclei: s }))}
+                            className={`w-full text-left rounded-lg px-3 py-2 text-xs transition ${
+                              pick.nuclei?.id === s.id ? "bg-zinc-100 text-zinc-900" : "hover:bg-zinc-100/60 text-zinc-700"
+                            }`}
+                          >
+                            <span className="font-semibold">#{s.id}</span>{" "}
+                            <span className="text-zinc-500">{new Date(s.scan_at).toLocaleString()}</span>
+                            <span className="block font-mono text-[11px] text-zinc-500 break-all">{s.result_file}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                )}
+              </section>
+
               {!hasAny && (
                 <p className="text-sm text-zinc-500">ยังไม่มีผลสแกนให้เลือก</p>
               )}
@@ -350,13 +417,13 @@ export default function LoadPreviousModal({
             </button>
             <button
               type="button"
-              disabled={!pick.katana && !pick.ffuf && !pick.payload_recon}
+              disabled={!pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei}
               onClick={() => {
                 onApply(pick);
                 onClose();
               }}
               className={`rounded-xl px-5 py-2.5 text-sm font-semibold shadow-lg transition ${
-                !pick.katana && !pick.ffuf && !pick.payload_recon
+                !pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei
                   ? "cursor-not-allowed bg-zinc-300 text-zinc-500"
                   : "bg-gradient-to-r from-amber-500 to-amber-600 text-white hover:from-amber-600 hover:to-amber-700"
               }`}

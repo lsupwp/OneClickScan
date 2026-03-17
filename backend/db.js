@@ -55,6 +55,14 @@ db.exec(`
     scan_at          DATETIME NOT NULL,
     FOREIGN KEY (payload_recon_id) REFERENCES payload_recon(id)
   );
+
+  CREATE TABLE IF NOT EXISTS nuclei (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL,
+    result_file TEXT NOT NULL,
+    scan_at     DATETIME NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
 `);
 
 // lightweight migrations for older DBs
@@ -144,6 +152,21 @@ const listPayloadReconAiByReconStmt = db.prepare(
    ORDER BY id DESC`
 );
 
+const countNucleiByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM nuclei WHERE target_id = ?'
+);
+
+const insertNucleiStmt = db.prepare(
+  'INSERT INTO nuclei (target_id, result_file, scan_at) VALUES (?, ?, ?)'
+);
+
+const listNucleiByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at
+   FROM nuclei
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
 function getOrCreateTarget(targetName) {
   let row = getOrCreateTargetStmt.get(targetName);
   if (!row) {
@@ -213,6 +236,20 @@ function listPayloadReconAiByRecon(payloadReconId) {
   return listPayloadReconAiByReconStmt.all(payloadReconId);
 }
 
+function getNucleiScanRound(targetId) {
+  const { count } = countNucleiByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertNucleiScan(targetId, resultFile, scanAt) {
+  const info = insertNucleiStmt.run(targetId, resultFile, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listNucleiByTarget(targetId) {
+  return listNucleiByTargetStmt.all(targetId);
+}
+
 module.exports = {
   db,
   getOrCreateTarget,
@@ -229,5 +266,8 @@ module.exports = {
   getPayloadReconById,
   insertPayloadReconAi,
   listPayloadReconAiByRecon,
+  getNucleiScanRound,
+  insertNucleiScan,
+  listNucleiByTarget,
 };
 
