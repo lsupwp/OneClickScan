@@ -63,6 +63,22 @@ db.exec(`
     scan_at     DATETIME NOT NULL,
     FOREIGN KEY (target_id) REFERENCES target(target_id)
   );
+
+  CREATE TABLE IF NOT EXISTS whatweb (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL,
+    result_file TEXT NOT NULL,
+    scan_at     DATETIME NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS subfinder (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id   INTEGER NOT NULL,
+    result_file TEXT NOT NULL,
+    scan_at     DATETIME NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
 `);
 
 // lightweight migrations for older DBs
@@ -167,6 +183,36 @@ const listNucleiByTargetStmt = db.prepare(
    ORDER BY id DESC`
 );
 
+const countWhatwebByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM whatweb WHERE target_id = ?'
+);
+
+const insertWhatwebStmt = db.prepare(
+  'INSERT INTO whatweb (target_id, result_file, scan_at) VALUES (?, ?, ?)'
+);
+
+const listWhatwebByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at
+   FROM whatweb
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
+const countSubfinderByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM subfinder WHERE target_id = ?'
+);
+
+const insertSubfinderStmt = db.prepare(
+  'INSERT INTO subfinder (target_id, result_file, scan_at) VALUES (?, ?, ?)'
+);
+
+const listSubfinderByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at
+   FROM subfinder
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
 function getOrCreateTarget(targetName) {
   let row = getOrCreateTargetStmt.get(targetName);
   if (!row) {
@@ -250,6 +296,34 @@ function listNucleiByTarget(targetId) {
   return listNucleiByTargetStmt.all(targetId);
 }
 
+function getWhatwebScanRound(targetId) {
+  const { count } = countWhatwebByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertWhatwebScan(targetId, resultFile, scanAt) {
+  const info = insertWhatwebStmt.run(targetId, resultFile, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listWhatwebByTarget(targetId) {
+  return listWhatwebByTargetStmt.all(targetId);
+}
+
+function getSubfinderScanRound(targetId) {
+  const { count } = countSubfinderByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertSubfinderScan(targetId, resultFile, scanAt) {
+  const info = insertSubfinderStmt.run(targetId, resultFile, scanAt);
+  return info.lastInsertRowid;
+}
+
+function listSubfinderByTarget(targetId) {
+  return listSubfinderByTargetStmt.all(targetId);
+}
+
 module.exports = {
   db,
   getOrCreateTarget,
@@ -269,5 +343,11 @@ module.exports = {
   getNucleiScanRound,
   insertNucleiScan,
   listNucleiByTarget,
+  getWhatwebScanRound,
+  insertWhatwebScan,
+  listWhatwebByTarget,
+  getSubfinderScanRound,
+  insertSubfinderScan,
+  listSubfinderByTarget,
 };
 

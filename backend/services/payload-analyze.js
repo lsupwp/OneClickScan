@@ -37,6 +37,19 @@ Rules:
 - If method is POST, include data params for the tool.
 - Always include the full URL.
 - Keep commands safe and non-destructive. No brute force, no credential stuffing.
+
+Tool flag constraints (CRITICAL: do NOT invent flags):
+- xsstrike allowed flags:
+  -u, --data, -e, --fuzzer, --timeout, --proxy, --crawl, --json, --path,
+  --seeds, -f, -l, --headers, -t, -d, --skip, --skip-dom, --blind,
+  --console-log-level, --file-log-level, --log-file
+- sqlmap allowed flags (common subset):
+  -u/--url, --data, --cookie, --random-agent, --proxy, --tor, --check-tor,
+  -p, --dbms, --level, --risk, --technique,
+  -a/--all, -b/--banner, --current-user, --current-db, --passwords,
+  --dbs, --tables, --columns, --schema, --dump, --dump-all,
+  -D, -T, -C, --os-shell, --os-pwn, --batch, --flush-session, -v
+- If you are unsure a flag exists, omit it. Prefer minimal valid commands that will run.
 `.trim();
 }
 

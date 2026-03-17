@@ -11,11 +11,15 @@ const {
 const { runPayloadRecon } = require('../services/payload-recon');
 const { analyzePayloadReconWithGemini } = require('../services/payload-analyze');
 const { startNucleiScan } = require('../services/nuclei');
+const { startWhatwebScan } = require('../services/whatweb');
+const { startSubfinderScan } = require('../services/subfinder');
 const {
   listTargets,
   listKatanaByTarget,
   listFfufByTarget,
   listNucleiByTarget,
+  listWhatwebByTarget,
+  listSubfinderByTarget,
   getOrCreateTarget,
   getPayloadReconScanRound,
   insertPayloadRecon,
@@ -115,6 +119,22 @@ router.get('/targets/:targetId/nuclei', (req, res) => {
   res.status(200).json(listNucleiByTarget(targetId));
 });
 
+router.get('/targets/:targetId/whatweb', (req, res) => {
+  const targetId = Number(req.params.targetId);
+  if (!Number.isFinite(targetId)) {
+    return res.status(400).json({ error: 'invalid targetId' });
+  }
+  res.status(200).json(listWhatwebByTarget(targetId));
+});
+
+router.get('/targets/:targetId/subfinder', (req, res) => {
+  const targetId = Number(req.params.targetId);
+  if (!Number.isFinite(targetId)) {
+    return res.status(400).json({ error: 'invalid targetId' });
+  }
+  res.status(200).json(listSubfinderByTarget(targetId));
+});
+
 router.get('/targets/:targetId/payload-recon', (req, res) => {
   const targetId = Number(req.params.targetId);
   if (!Number.isFinite(targetId)) {
@@ -136,6 +156,38 @@ router.post('/scan/nuclei', async (req, res) => {
   } catch (err) {
     console.error('Failed to start nuclei scan:', err);
     res.status(500).json({ error: 'Failed to start nuclei scan' });
+  }
+});
+
+router.post('/scan/whatweb', async (req, res) => {
+  const { target_url: targetUrl, aggression, plugins } = req.body || {};
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).json({ error: 'target_url is required' });
+  }
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  try {
+    await startWhatwebScan({ targetUrl, jobId, aggression, plugins });
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('Failed to start whatweb scan:', err);
+    res.status(500).json({ error: 'Failed to start whatweb scan' });
+  }
+});
+
+router.post('/scan/subfinder', async (req, res) => {
+  const { target_url: targetUrl, httpx_timeout_sec: httpxTimeoutSec } = req.body || {};
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).json({ error: 'target_url is required' });
+  }
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  try {
+    await startSubfinderScan({ targetUrl, jobId, httpxTimeoutSec });
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('Failed to start subfinder scan:', err);
+    res.status(500).json({ error: 'Failed to start subfinder scan' });
   }
 });
 

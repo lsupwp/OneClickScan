@@ -62,6 +62,7 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
   const [recs, setRecs] = useState<AnalyzeRec[] | null>(null);
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
   const autoRequestedRef = useRef(false);
+  const lastReconIdRef = useRef<number | null>(null);
 
   const sortedRecs = useMemo(() => {
     if (!recs) return null;
@@ -69,7 +70,16 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
   }, [recs]);
 
   useEffect(() => {
-    if (!payloadEntries || payloadEntries.length === 0) return;
+    if (!payloadReconId) return;
+    if (lastReconIdRef.current !== payloadReconId) {
+      lastReconIdRef.current = payloadReconId;
+      autoRequestedRef.current = false;
+      setAnalyzeError(null);
+      setRecs(null);
+    }
+  }, [payloadReconId]);
+
+  useEffect(() => {
     if (!payloadReconId) return;
     if (recs) return;
     if (analyzing) return;
@@ -80,14 +90,30 @@ export default function PayloadReconOutput({ payloadEntries, payloadReconId = nu
       setAnalyzing(true);
       setAnalyzeError(null);
       try {
-        const res = await fetch(`${resolvedBackend}/api/payload/analyze`, {
+        // 1) Try fetch existing analysis by id (no entries needed)
+        const res1 = await fetch(`${resolvedBackend}/api/payload/analyze`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ payload_recon_id: payloadReconId }),
+        });
+        const data1 = await res1.json();
+        if (res1.ok) {
+          setRecs(Array.isArray(data1) ? (data1 as AnalyzeRec[]) : []);
+          return;
+        }
+
+        // 2) If no cached analysis, and we have entries, run analysis now
+        if (!payloadEntries || payloadEntries.length === 0) {
+          throw new Error(data1?.error || "analyze failed");
+        }
+        const res2 = await fetch(`${resolvedBackend}/api/payload/analyze`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ payload_recon_id: payloadReconId, entries: payloadEntries }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data?.error || "analyze failed");
-        setRecs(Array.isArray(data) ? (data as AnalyzeRec[]) : []);
+        const data2 = await res2.json();
+        if (!res2.ok) throw new Error(data2?.error || "analyze failed");
+        setRecs(Array.isArray(data2) ? (data2 as AnalyzeRec[]) : []);
       } catch (e) {
         setAnalyzeError((e as Error).message);
       } finally {

@@ -18,7 +18,7 @@ const WS_URL = () => {
   return b.replace("http://", "ws://");
 };
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
 type JobPhase = "idle" | "starting" | "processing" | "scoring" | "done" | "error";
 
 type KatanaFlagDef = {
@@ -56,6 +56,8 @@ export default function ScanClient() {
     ffuf: false,
     payload_recon: false,
     nuclei: false,
+    whatweb: false,
+    subfinder: false,
   });
 
   const [errorModalMessage, setErrorModalMessage] = useState<string | null>(null);
@@ -77,6 +79,9 @@ export default function ScanClient() {
   const [ffufAutoCalibrate, setFfufAutoCalibrate] = useState(false);
   const ffufFileInputRef = useRef<HTMLInputElement>(null);
 
+  // Subfinder config
+  const [subfinderHttpxTimeoutSec, setSubfinderHttpxTimeoutSec] = useState<number | "">(5);
+
   // Job state
   const [katanaPhase, setKatanaPhase] = useState<JobPhase>("idle");
   const [katanaStatus, setKatanaStatus] = useState("");
@@ -97,18 +102,35 @@ export default function ScanClient() {
   const [nucleiResultFile, setNucleiResultFile] = useState<string | null>(null);
   const [nucleiLogs, setNucleiLogs] = useState<string[]>([]);
 
+  // WhatWeb job state
+  const [whatwebPhase, setWhatwebPhase] = useState<JobPhase>("idle");
+  const [whatwebStatus, setWhatwebStatus] = useState("");
+  const [whatwebJobId, setWhatwebJobId] = useState<string | null>(null);
+  const [whatwebResultFile, setWhatwebResultFile] = useState<string | null>(null);
+  const [whatwebLogs, setWhatwebLogs] = useState<string[]>([]);
+  const [whatwebAggression, setWhatwebAggression] = useState<1 | 3 | 4>(1);
+
+  // Subfinder job state
+  const [subfinderPhase, setSubfinderPhase] = useState<JobPhase>("idle");
+  const [subfinderStatus, setSubfinderStatus] = useState("");
+  const [subfinderJobId, setSubfinderJobId] = useState<string | null>(null);
+  const [subfinderResultFile, setSubfinderResultFile] = useState<string | null>(null);
+  const [subfinderLogs, setSubfinderLogs] = useState<string[]>([]);
+
   const [payloadPhase, setPayloadPhase] = useState<"idle" | "running" | "done" | "error">("idle");
   const [payloadEntries, setPayloadEntries] = useState<PayloadEntry[] | null>(null);
   const [payloadResultFile, setPayloadResultFile] = useState<string | null>(null);
   const [payloadReconId, setPayloadReconId] = useState<number | null>(null);
 
   const [configModalTool, setConfigModalTool] = useState<null | ToolId>(null);
-  const [outputModalTool, setOutputModalTool] = useState<null | "katana" | "ffuf" | "payload_recon" | "nuclei">(null);
+  const [outputModalTool, setOutputModalTool] = useState<null | ToolId>(null);
   const [loadPreviousOpen, setLoadPreviousOpen] = useState(false);
 
   const katanaWsRef = useRef<WebSocket | null>(null);
   const ffufWsRef = useRef<WebSocket | null>(null);
   const nucleiWsRef = useRef<WebSocket | null>(null);
+  const whatwebWsRef = useRef<WebSocket | null>(null);
+  const subfinderWsRef = useRef<WebSocket | null>(null);
   const payloadReconStartedRef = useRef(false);
 
   const anyRunning =
@@ -121,6 +143,12 @@ export default function ScanClient() {
     nucleiPhase === "starting" ||
     nucleiPhase === "processing" ||
     nucleiPhase === "scoring" ||
+    whatwebPhase === "starting" ||
+    whatwebPhase === "processing" ||
+    whatwebPhase === "scoring" ||
+    subfinderPhase === "starting" ||
+    subfinderPhase === "processing" ||
+    subfinderPhase === "scoring" ||
     payloadPhase === "running";
 
   useEffect(() => {
@@ -162,6 +190,8 @@ export default function ScanClient() {
       katanaWsRef.current?.close();
       ffufWsRef.current?.close();
       nucleiWsRef.current?.close();
+      whatwebWsRef.current?.close();
+      subfinderWsRef.current?.close();
     };
   }, []);
 
@@ -320,7 +350,9 @@ export default function ScanClient() {
     const runKatana = selectedTools.katana;
     const runFfuf = selectedTools.ffuf;
     const runNuclei = selectedTools.nuclei;
-    if (!runKatana && !runFfuf && !runNuclei) {
+    const runWhatweb = selectedTools.whatweb;
+    const runSubfinder = selectedTools.subfinder;
+    if (!runKatana && !runFfuf && !runNuclei && !runWhatweb && !runSubfinder) {
       setErrorModalMessage("กรุณาเลือกอย่างน้อย 1 tool");
       return;
     }
@@ -332,6 +364,8 @@ export default function ScanClient() {
     const runKatana = selectedTools.katana && katanaPhase !== "done";
     const runFfuf = selectedTools.ffuf && ffufPhase !== "done";
     const runNuclei = selectedTools.nuclei && nucleiPhase !== "done";
+    const runWhatweb = selectedTools.whatweb && whatwebPhase !== "done";
+    const runSubfinder = selectedTools.subfinder && subfinderPhase !== "done";
     if (runFfuf && ffufWordlistMode === "upload" && !ffufUploadedFileId) {
       setErrorModalMessage("กรุณาอัปโหลด wordlist (.txt) สำหรับ FFuf ก่อน");
       return;
@@ -350,6 +384,13 @@ export default function ScanClient() {
       setFfufJobId(null);
       setFfufResultFile(null);
       setFfufLogs([]);
+    }
+    if (runSubfinder) {
+      setSubfinderPhase("idle");
+      setSubfinderStatus("");
+      setSubfinderJobId(null);
+      setSubfinderResultFile(null);
+      setSubfinderLogs([]);
     }
     setPayloadPhase("idle");
     setPayloadEntries(null);
@@ -509,6 +550,111 @@ export default function ScanClient() {
       };
     }
 
+    if (runWhatweb) {
+      setWhatwebPhase("starting");
+      setWhatwebStatus("Connecting...");
+      whatwebWsRef.current?.close();
+      const ws = new WebSocket(wsUrl);
+      whatwebWsRef.current = ws;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "status") {
+            setWhatwebPhase(msg.status === "starting" || msg.status === "processing" || msg.status === "scoring" ? msg.status : "starting");
+            if (msg.message) setWhatwebStatus(msg.message);
+          } else if (msg.type === "progress" && msg.message?.trim()) {
+            setWhatwebLogs((prev) => [...prev, msg.message.trimEnd()]);
+          } else if (msg.type === "done") {
+            setWhatwebPhase("done");
+            setWhatwebStatus("Done.");
+            if (msg.resultFile) setWhatwebResultFile(msg.resultFile);
+          } else if (msg.type === "error") {
+            setWhatwebPhase("error");
+            setWhatwebStatus(msg.message);
+          }
+        } catch {}
+      };
+      ws.onopen = async () => {
+        try {
+          const res = await fetch(`${backend}/api/scan/whatweb`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ target_url: targetUrl.trim(), aggression: whatwebAggression }),
+          });
+          const data = (await res.json()) as { jobId?: string; error?: string };
+          if (!data.jobId) {
+            setWhatwebPhase("error");
+            setWhatwebStatus(data.error || "Failed to start");
+            return;
+          }
+          setWhatwebJobId(data.jobId);
+          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+          setWhatwebStatus("Subscribed. Running...");
+        } catch (e) {
+          setWhatwebPhase("error");
+          setWhatwebStatus((e as Error).message);
+        }
+      };
+      ws.onerror = () => {
+        setWhatwebPhase("error");
+        setWhatwebStatus("WebSocket error");
+      };
+    }
+
+    if (runSubfinder) {
+      setSubfinderPhase("starting");
+      setSubfinderStatus("Connecting...");
+      subfinderWsRef.current?.close();
+      const ws = new WebSocket(wsUrl);
+      subfinderWsRef.current = ws;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "status") {
+            setSubfinderPhase(msg.status === "starting" || msg.status === "processing" || msg.status === "scoring" ? msg.status : "starting");
+            if (msg.message) setSubfinderStatus(msg.message);
+          } else if (msg.type === "progress" && msg.message?.trim()) {
+            setSubfinderLogs((prev) => [...prev, msg.message.trimEnd()]);
+          } else if (msg.type === "done") {
+            setSubfinderPhase("done");
+            setSubfinderStatus("Done.");
+            if (msg.resultFile) setSubfinderResultFile(msg.resultFile);
+          } else if (msg.type === "error") {
+            setSubfinderPhase("error");
+            setSubfinderStatus(msg.message);
+          }
+        } catch {}
+      };
+      ws.onopen = async () => {
+        try {
+          const res = await fetch(`${backend}/api/scan/subfinder`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              target_url: targetUrl.trim(),
+              httpx_timeout_sec: subfinderHttpxTimeoutSec === "" ? undefined : subfinderHttpxTimeoutSec,
+            }),
+          });
+          const data = (await res.json()) as { jobId?: string; error?: string };
+          if (!data.jobId) {
+            setSubfinderPhase("error");
+            setSubfinderStatus(data.error || "Failed to start");
+            return;
+          }
+          setSubfinderJobId(data.jobId);
+          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+          setSubfinderStatus("Subscribed. Running...");
+        } catch (e) {
+          setSubfinderPhase("error");
+          setSubfinderStatus((e as Error).message);
+        }
+      };
+      ws.onerror = () => {
+        setSubfinderPhase("error");
+        setSubfinderStatus("WebSocket error");
+      };
+    }
+
   }
 
   function resetKatanaForRescan() {
@@ -540,7 +686,22 @@ export default function ScanClient() {
   function resetAllRound() {
     resetKatanaForRescan();
     resetFfufForRescan();
-    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false });
+    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false, whatweb: false, subfinder: false });
+    setNucleiPhase("idle");
+    setNucleiStatus("");
+    setNucleiJobId(null);
+    setNucleiResultFile(null);
+    setNucleiLogs([]);
+    setWhatwebPhase("idle");
+    setWhatwebStatus("");
+    setWhatwebJobId(null);
+    setWhatwebResultFile(null);
+    setWhatwebLogs([]);
+    setSubfinderPhase("idle");
+    setSubfinderStatus("");
+    setSubfinderJobId(null);
+    setSubfinderResultFile(null);
+    setSubfinderLogs([]);
     setOutputModalTool(null);
     setConfigModalTool(null);
   }
@@ -655,6 +816,8 @@ export default function ScanClient() {
                 { id: "ffuf" as const, label: "FFuf Hidden Path", desc: "Wordlist + Gemini score" },
                 { id: "payload_recon" as const, label: "Payload Recon", desc: "รันหลัง Katana/FFuf" },
                 { id: "nuclei" as const, label: "Nuclei", desc: "Templates scan (filtered JSON output)" },
+                { id: "whatweb" as const, label: "WhatWeb", desc: "Fingerprint (dynamic plugins JSON)" },
+                { id: "subfinder" as const, label: "Subfinder", desc: "Subdomains + httpx (alive 200)" },
               ] as const
             ).map(({ id, label, desc }) => (
               <label
@@ -819,9 +982,54 @@ export default function ScanClient() {
                 } : undefined}
               />
             )}
+            {selectedTools.whatweb && (
+              <ToolCard
+                label="WhatWeb"
+                phase={whatwebPhase}
+                status={whatwebStatus}
+                configSummary={`-a ${whatwebAggression}`}
+                onClick={() => {
+                  if (whatwebPhase === "idle") setConfigModalTool("whatweb");
+                  else setOutputModalTool("whatweb");
+                }}
+                canClickOutput={whatwebPhase === "done" || whatwebPhase === "error"}
+                isRunning={whatwebPhase === "starting" || whatwebPhase === "processing" || whatwebPhase === "scoring"}
+                clickable={true}
+                onRescan={whatwebPhase === "done" || whatwebPhase === "error" ? () => {
+                  setWhatwebPhase("idle");
+                  setWhatwebStatus("");
+                  setWhatwebJobId(null);
+                  setWhatwebResultFile(null);
+                  setWhatwebLogs([]);
+                } : undefined}
+              />
+            )}
+
+            {selectedTools.subfinder && (
+              <ToolCard
+                label="Subfinder"
+                phase={subfinderPhase}
+                status={subfinderStatus}
+                configSummary={`httpx timeout: ${subfinderHttpxTimeoutSec || 5}s`}
+                onClick={() => {
+                  if (subfinderPhase === "idle") setConfigModalTool("subfinder");
+                  else setOutputModalTool("subfinder");
+                }}
+                canClickOutput={subfinderPhase === "done" || subfinderPhase === "error"}
+                isRunning={subfinderPhase === "starting" || subfinderPhase === "processing" || subfinderPhase === "scoring"}
+                clickable={true}
+                onRescan={subfinderPhase === "done" || subfinderPhase === "error" ? () => {
+                  setSubfinderPhase("idle");
+                  setSubfinderStatus("");
+                  setSubfinderJobId(null);
+                  setSubfinderResultFile(null);
+                  setSubfinderLogs([]);
+                } : undefined}
+              />
+            )}
           </div>
 
-          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && (
+          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && !selectedTools.whatweb && !selectedTools.subfinder && (
             <div className="rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 p-12 text-center">
               <p className="text-sm font-medium text-zinc-500">เลือก tools ด้านซ้าย จะเปิด modal ตั้งค่าของ tool นั้น แล้วกด Run เพื่อเริ่มสแกน</p>
             </div>
@@ -857,6 +1065,10 @@ export default function ScanClient() {
         setFfufFollowRedirects={setFfufFollowRedirects}
         ffufAutoCalibrate={ffufAutoCalibrate}
         setFfufAutoCalibrate={setFfufAutoCalibrate}
+        whatwebAggression={whatwebAggression}
+        setWhatwebAggression={setWhatwebAggression}
+        subfinderHttpxTimeoutSec={subfinderHttpxTimeoutSec}
+        setSubfinderHttpxTimeoutSec={setSubfinderHttpxTimeoutSec}
       />
 
       <OutputModal
@@ -871,13 +1083,17 @@ export default function ScanClient() {
               ? (ffufPhase === "starting" || ffufPhase === "processing" || ffufPhase === "scoring" ? "running" : ffufPhase === "error" ? "error" : "done")
               : outputModalTool === "nuclei"
                 ? (nucleiPhase === "starting" || nucleiPhase === "processing" || nucleiPhase === "scoring" ? "running" : nucleiPhase === "error" ? "error" : "done")
+                : outputModalTool === "whatweb"
+                  ? (whatwebPhase === "starting" || whatwebPhase === "processing" || whatwebPhase === "scoring" ? "running" : whatwebPhase === "error" ? "error" : "done")
+                  : outputModalTool === "subfinder"
+                    ? (subfinderPhase === "starting" || subfinderPhase === "processing" || subfinderPhase === "scoring" ? "running" : subfinderPhase === "error" ? "error" : "done")
               : payloadPhase === "error"
                 ? "error"
                 : "done"
         }
-        status={outputModalTool === "katana" ? katanaStatus : outputModalTool === "ffuf" ? ffufStatus : outputModalTool === "nuclei" ? nucleiStatus : payloadPhase === "done" ? `พบ ${payloadEntries?.length ?? 0} รายการ` : "เกิดข้อผิดพลาด"}
-        logs={outputModalTool === "katana" ? katanaLogs : outputModalTool === "ffuf" ? ffufLogs : outputModalTool === "nuclei" ? nucleiLogs : undefined}
-        resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : outputModalTool === "nuclei" ? nucleiResultFile : null}
+        status={outputModalTool === "katana" ? katanaStatus : outputModalTool === "ffuf" ? ffufStatus : outputModalTool === "nuclei" ? nucleiStatus : outputModalTool === "whatweb" ? whatwebStatus : outputModalTool === "subfinder" ? subfinderStatus : payloadPhase === "done" ? `พบ ${payloadEntries?.length ?? 0} รายการ` : "เกิดข้อผิดพลาด"}
+        logs={outputModalTool === "katana" ? katanaLogs : outputModalTool === "ffuf" ? ffufLogs : outputModalTool === "nuclei" ? nucleiLogs : outputModalTool === "whatweb" ? whatwebLogs : outputModalTool === "subfinder" ? subfinderLogs : undefined}
+        resultFile={outputModalTool === "katana" ? katanaResultFile : outputModalTool === "ffuf" ? ffufResultFile : outputModalTool === "nuclei" ? nucleiResultFile : outputModalTool === "whatweb" ? whatwebResultFile : outputModalTool === "subfinder" ? subfinderResultFile : null}
         backend={backend}
         payloadEntries={outputModalTool === "payload_recon" ? payloadEntries : undefined}
         payloadReconId={outputModalTool === "payload_recon" ? payloadReconId : null}
@@ -895,6 +1111,9 @@ export default function ScanClient() {
             katana: prev.katana || !!sel.katana,
             ffuf: prev.ffuf || !!sel.ffuf,
             payload_recon: prev.payload_recon, // user can enable separately
+            nuclei: prev.nuclei || !!sel.nuclei,
+            whatweb: prev.whatweb || !!sel.whatweb,
+            subfinder: prev.subfinder || !!sel.subfinder,
           }));
           if (sel.katana) {
             setKatanaPhase("done");
@@ -932,6 +1151,22 @@ export default function ScanClient() {
             setNucleiJobId(null);
             setNucleiResultFile(sel.nuclei.result_file);
             setNucleiLogs([]);
+          }
+          if (sel.whatweb) {
+            setSelectedTools((prev) => ({ ...prev, whatweb: true }));
+            setWhatwebPhase("done");
+            setWhatwebStatus("Loaded previous scan");
+            setWhatwebJobId(null);
+            setWhatwebResultFile(sel.whatweb.result_file);
+            setWhatwebLogs([]);
+          }
+          if (sel.subfinder) {
+            setSelectedTools((prev) => ({ ...prev, subfinder: true }));
+            setSubfinderPhase("done");
+            setSubfinderStatus("Loaded previous scan");
+            setSubfinderJobId(null);
+            setSubfinderResultFile(sel.subfinder.result_file);
+            setSubfinderLogs([]);
           }
           payloadReconStartedRef.current = false;
           if (!sel.payload_recon) {

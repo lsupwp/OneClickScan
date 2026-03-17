@@ -2,7 +2,7 @@
 
 import { useRef } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
 type KatanaFlagDef = {
   name: string;
   label: string;
@@ -42,6 +42,12 @@ type ConfigModalProps = {
   setFfufFollowRedirects: (v: boolean) => void;
   ffufAutoCalibrate: boolean;
   setFfufAutoCalibrate: (v: boolean) => void;
+  // WhatWeb
+  whatwebAggression: 1 | 3 | 4;
+  setWhatwebAggression: (v: 1 | 3 | 4) => void;
+  // Subfinder
+  subfinderHttpxTimeoutSec: number | "";
+  setSubfinderHttpxTimeoutSec: (v: number | "") => void;
 };
 
 export default function ConfigModal({
@@ -72,6 +78,10 @@ export default function ConfigModal({
   setFfufFollowRedirects,
   ffufAutoCalibrate,
   setFfufAutoCalibrate,
+  whatwebAggression,
+  setWhatwebAggression,
+  subfinderHttpxTimeoutSec,
+  setSubfinderHttpxTimeoutSec,
 }: ConfigModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
 
@@ -81,8 +91,18 @@ export default function ConfigModal({
     if (e.target === overlayRef.current) onClose();
   };
 
-  const title = tool === "katana" ? "Katana" : tool === "ffuf" ? "FFuf" : "Payload Recon";
-  const title2 = tool === "katana" ? "Katana" : tool === "ffuf" ? "FFuf" : tool === "nuclei" ? "Nuclei" : "Payload Recon";
+  const title2 =
+    tool === "katana"
+      ? "Katana"
+      : tool === "ffuf"
+        ? "FFuf"
+        : tool === "nuclei"
+          ? "Nuclei"
+          : tool === "whatweb"
+            ? "WhatWeb"
+            : tool === "subfinder"
+              ? "Subfinder"
+              : "Payload Recon";
   const subtitle =
     tool === "katana"
       ? "ตั้งค่า flags สำหรับ crawl"
@@ -90,6 +110,10 @@ export default function ConfigModal({
         ? "ตั้งค่า wordlist และ options"
         : tool === "nuclei"
           ? "สแกนด้วย templates และเก็บผลแบบ filtered JSON"
+          : tool === "whatweb"
+            ? "Fingerprint และสรุป plugins แบบ dynamic JSON"
+          : tool === "subfinder"
+            ? "หา subdomains ด้วย subfinder และเช็ค alive ด้วย httpx (เก็บเฉพาะ status 200)"
           : "รันหลัง Katana/FFuf เสร็จ";
 
   return (
@@ -233,6 +257,62 @@ export default function ConfigModal({
                 รัน nuclei ใน container แล้วแปลง output JSONL ให้เหลือ fields สำคัญ:{" "}
                 <span className="font-mono">name,severity,matchedAt,templateId,description,cve</span>
               </p>
+            </section>
+          )}
+
+          {tool === "whatweb" && (
+            <section className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 space-y-4">
+              <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">W</span>
+                WhatWeb
+              </h3>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-600">Aggression (-a)</label>
+                  <select
+                    value={whatwebAggression}
+                    onChange={(e) => setWhatwebAggression(Number(e.target.value) as 1 | 3 | 4)}
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                  >
+                    <option value={1}>1 (Stealthy)</option>
+                    <option value={3}>3 (Aggressive)</option>
+                    <option value={4}>4 (Heavy)</option>
+                  </select>
+                  <p className="mt-2 text-[11px] text-zinc-500">WhatWeb 0.6.3 รองรับแค่ 1, 3, 4</p>
+                </div>
+                <div className="sm:col-span-1">
+                  <p className="text-xs font-semibold text-zinc-600">Plugins</p>
+                  <p className="mt-1 text-[11px] text-zinc-500">
+                    ค่า default จะให้ WhatWeb ตรวจทั้งหมดและ output จะถูกบันทึกเป็น JSON โดย UI จะ loop แสดง key ต่างๆ แบบ dynamic ไม่ตัดทิ้ง
+                  </p>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {tool === "subfinder" && (
+            <section className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 space-y-4">
+              <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">S</span>
+                Subfinder
+              </h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-600">httpx timeout (seconds)</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={subfinderHttpxTimeoutSec}
+                    onChange={(e) => setSubfinderHttpxTimeoutSec(e.target.value === "" ? "" : Number(e.target.value))}
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                    placeholder="5"
+                  />
+                  <p className="mt-2 text-[11px] text-zinc-500">
+                    จะใช้ scheme ตาม URL ที่ใส่มา (http/https) แล้วเก็บเฉพาะ subdomain ที่ตอบ status 200
+                  </p>
+                </div>
+              </div>
             </section>
           )}
         </div>

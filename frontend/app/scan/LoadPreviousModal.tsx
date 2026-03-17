@@ -2,19 +2,23 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder";
 
 type TargetRow = { target_id: number; target_name: string };
 type KatanaScanRow = { id: number; target_id: number; result_file: string; flags_json?: string | null; scan_at: string };
 type FfufScanRow = { id: number; target_id: number; result_file: string; wordlist_source?: string | null; scan_at: string };
 type PayloadReconScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
 type NucleiScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
+type WhatwebScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
+type SubfinderScanRow = { id: number; target_id: number; result_file: string; scan_at: string };
 
 type LoadPreviousSelection = {
   katana?: KatanaScanRow | null;
   ffuf?: FfufScanRow | null;
   payload_recon?: PayloadReconScanRow | null;
   nuclei?: NucleiScanRow | null;
+  whatweb?: WhatwebScanRow | null;
+  subfinder?: SubfinderScanRow | null;
 };
 
 export default function LoadPreviousModal({
@@ -38,7 +42,9 @@ export default function LoadPreviousModal({
   const [ffufScans, setFfufScans] = useState<FfufScanRow[]>([]);
   const [payloadScans, setPayloadScans] = useState<PayloadReconScanRow[]>([]);
   const [nucleiScans, setNucleiScans] = useState<NucleiScanRow[]>([]);
-  const [pick, setPick] = useState<LoadPreviousSelection>({ katana: null, ffuf: null, payload_recon: null, nuclei: null });
+  const [whatwebScans, setWhatwebScans] = useState<WhatwebScanRow[]>([]);
+  const [subfinderScans, setSubfinderScans] = useState<SubfinderScanRow[]>([]);
+  const [pick, setPick] = useState<LoadPreviousSelection>({ katana: null, ffuf: null, payload_recon: null, nuclei: null, whatweb: null, subfinder: null });
 
   const normalizedUrl = useMemo(() => normalizeUrl(targetUrl), [targetUrl]);
 
@@ -50,7 +56,9 @@ export default function LoadPreviousModal({
     setFfufScans([]);
     setPayloadScans([]);
     setNucleiScans([]);
-    setPick({ katana: null, ffuf: null, payload_recon: null, nuclei: null });
+    setWhatwebScans([]);
+    setSubfinderScans([]);
+    setPick({ katana: null, ffuf: null, payload_recon: null, nuclei: null, whatweb: null, subfinder: null });
 
     const url = normalizedUrl;
     if (!url) {
@@ -73,21 +81,27 @@ export default function LoadPreviousModal({
         }
         setTarget(exact);
 
-        const [kRes, fRes, pRes, nRes] = await Promise.all([
+        const [kRes, fRes, pRes, nRes, wRes, sRes] = await Promise.all([
           fetch(`${backend}/api/targets/${exact.target_id}/katana`, { cache: "no-store" }),
           fetch(`${backend}/api/targets/${exact.target_id}/ffuf`, { cache: "no-store" }),
           fetch(`${backend}/api/targets/${exact.target_id}/payload-recon`, { cache: "no-store" }),
           fetch(`${backend}/api/targets/${exact.target_id}/nuclei`, { cache: "no-store" }),
+          fetch(`${backend}/api/targets/${exact.target_id}/whatweb`, { cache: "no-store" }),
+          fetch(`${backend}/api/targets/${exact.target_id}/subfinder`, { cache: "no-store" }),
         ]);
         const kData = (await kRes.json()) as KatanaScanRow[];
         const fData = (await fRes.json()) as FfufScanRow[];
         const pData = (await pRes.json()) as PayloadReconScanRow[];
         const nData = (await nRes.json()) as NucleiScanRow[];
+        const wData = (await wRes.json()) as WhatwebScanRow[];
+        const sData = (await sRes.json()) as SubfinderScanRow[];
         if (cancelled) return;
         setKatanaScans(Array.isArray(kData) ? kData.slice(0, 10) : []);
         setFfufScans(Array.isArray(fData) ? fData.slice(0, 10) : []);
         setPayloadScans(Array.isArray(pData) ? pData.slice(0, 10) : []);
         setNucleiScans(Array.isArray(nData) ? nData.slice(0, 10) : []);
+        setWhatwebScans(Array.isArray(wData) ? wData.slice(0, 10) : []);
+        setSubfinderScans(Array.isArray(sData) ? sData.slice(0, 10) : []);
         setLoading(false);
       } catch (e) {
         if (!cancelled) {
@@ -107,7 +121,7 @@ export default function LoadPreviousModal({
     if (e.target === overlayRef.current) onClose();
   };
 
-  const hasAny = katanaScans.length > 0 || ffufScans.length > 0 || payloadScans.length > 0 || nucleiScans.length > 0;
+  const hasAny = katanaScans.length > 0 || ffufScans.length > 0 || payloadScans.length > 0 || nucleiScans.length > 0 || whatwebScans.length > 0 || subfinderScans.length > 0;
 
   return (
     <div
@@ -396,6 +410,126 @@ export default function LoadPreviousModal({
                 )}
               </section>
 
+              <section className="rounded-2xl border border-zinc-200 bg-zinc-50/40 p-4">
+                <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">W</span>
+                  WhatWeb
+                </h3>
+                {whatwebScans.length === 0 ? (
+                  <p className="mt-2 text-sm text-zinc-500">ยังไม่มีประวัติ WhatWeb</p>
+                ) : (
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white p-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-zinc-800">
+                          {pick.whatweb ? `Scan #${pick.whatweb.id}` : "ยังไม่ได้เลือก"}
+                        </p>
+                        <p className="mt-0.5 text-xs text-zinc-500 truncate">
+                          {pick.whatweb ? `${new Date(pick.whatweb.scan_at).toLocaleString()} • ${pick.whatweb.result_file}` : "—"}
+                        </p>
+                      </div>
+                      <select
+                        value={pick.whatweb?.id ?? ""}
+                        onChange={(e) => {
+                          const id = Number(e.target.value);
+                          const row = whatwebScans.find((x) => x.id === id) || null;
+                          setPick((p) => ({ ...p, whatweb: row }));
+                        }}
+                        className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                      >
+                        <option value="">เลือกสแกน…</option>
+                        {whatwebScans.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            #{s.id} • {new Date(s.scan_at).toLocaleString()}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <details className="rounded-xl border border-zinc-200 bg-white/60">
+                      <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/60">
+                        ดูรายการทั้งหมด ({whatwebScans.length})
+                      </summary>
+                      <div className="border-t border-zinc-200 p-2 max-h-48 overflow-auto">
+                        {whatwebScans.map((s) => (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={() => setPick((p) => ({ ...p, whatweb: s }))}
+                            className={`w-full text-left rounded-lg px-3 py-2 text-xs transition ${
+                              pick.whatweb?.id === s.id ? "bg-zinc-100 text-zinc-900" : "hover:bg-zinc-100/60 text-zinc-700"
+                            }`}
+                          >
+                            <span className="font-semibold">#{s.id}</span>{" "}
+                            <span className="text-zinc-500">{new Date(s.scan_at).toLocaleString()}</span>
+                            <span className="block font-mono text-[11px] text-zinc-500 break-all">{s.result_file}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                )}
+              </section>
+
+              <section className="rounded-2xl border border-zinc-200 bg-zinc-50/40 p-4">
+                <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                  <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-zinc-200 text-zinc-800 text-xs font-bold">S</span>
+                  Subfinder
+                </h3>
+                {subfinderScans.length === 0 ? (
+                  <p className="mt-2 text-sm text-zinc-500">ยังไม่มีประวัติ Subfinder</p>
+                ) : (
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white p-3">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-zinc-800">
+                          {pick.subfinder ? `Scan #${pick.subfinder.id}` : "ยังไม่ได้เลือก"}
+                        </p>
+                        <p className="mt-0.5 text-xs text-zinc-500 truncate">
+                          {pick.subfinder ? `${new Date(pick.subfinder.scan_at).toLocaleString()} • ${pick.subfinder.result_file}` : "—"}
+                        </p>
+                      </div>
+                      <select
+                        value={pick.subfinder?.id ?? ""}
+                        onChange={(e) => {
+                          const id = Number(e.target.value);
+                          const row = subfinderScans.find((x) => x.id === id) || null;
+                          setPick((p) => ({ ...p, subfinder: row }));
+                        }}
+                        className="shrink-0 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                      >
+                        <option value="">เลือกสแกน…</option>
+                        {subfinderScans.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            #{s.id} • {new Date(s.scan_at).toLocaleString()}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <details className="rounded-xl border border-zinc-200 bg-white/60">
+                      <summary className="cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-100/60">
+                        ดูรายการทั้งหมด ({subfinderScans.length})
+                      </summary>
+                      <div className="border-t border-zinc-200 p-2 max-h-48 overflow-auto">
+                        {subfinderScans.map((s) => (
+                          <button
+                            key={s.id}
+                            type="button"
+                            onClick={() => setPick((p) => ({ ...p, subfinder: s }))}
+                            className={`w-full text-left rounded-lg px-3 py-2 text-xs transition ${
+                              pick.subfinder?.id === s.id ? "bg-zinc-100 text-zinc-900" : "hover:bg-zinc-100/60 text-zinc-700"
+                            }`}
+                          >
+                            <span className="font-semibold">#{s.id}</span>{" "}
+                            <span className="text-zinc-500">{new Date(s.scan_at).toLocaleString()}</span>
+                            <span className="block font-mono text-[11px] text-zinc-500 break-all">{s.result_file}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                )}
+              </section>
+
               {!hasAny && (
                 <p className="text-sm text-zinc-500">ยังไม่มีผลสแกนให้เลือก</p>
               )}
@@ -417,13 +551,13 @@ export default function LoadPreviousModal({
             </button>
             <button
               type="button"
-              disabled={!pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei}
+              disabled={!pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei && !pick.whatweb && !pick.subfinder}
               onClick={() => {
                 onApply(pick);
                 onClose();
               }}
               className={`rounded-xl px-5 py-2.5 text-sm font-semibold shadow-lg transition ${
-                !pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei
+                !pick.katana && !pick.ffuf && !pick.payload_recon && !pick.nuclei && !pick.whatweb && !pick.subfinder
                   ? "cursor-not-allowed bg-zinc-300 text-zinc-500"
                   : "bg-gradient-to-r from-amber-500 to-amber-600 text-white hover:from-amber-600 hover:to-amber-700"
               }`}
