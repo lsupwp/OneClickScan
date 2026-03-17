@@ -17,6 +17,7 @@ RUN apt-get update && \
     python3-pip \
     python3-setuptools \
     sqlmap \
+    nmap \
     whatweb \
     subfinder \
     ffuf \
