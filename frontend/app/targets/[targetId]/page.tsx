@@ -16,35 +16,74 @@ type FfufScanRow = {
   scan_at: string;
 };
 
+type ScanRow = {
+  id: number;
+  target_id?: number;
+  result_file: string;
+  scan_at: string;
+};
+
 type TargetRow = {
   target_id: number;
   target_name: string;
 };
 
-async function getTargets(targetId: number) {
-  const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080";
-  const res = await fetch(`${base}/api/targets?q=`, { cache: "no-store" });
+const BASE = () =>
+  process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080";
+
+async function getTarget(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets?q=`, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to load targets");
   const all = (await res.json()) as TargetRow[];
   return all.find((t) => t.target_id === targetId) || null;
 }
 
 async function getKatanaScans(targetId: number) {
-  const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080";
-  const res = await fetch(`${base}/api/targets/${targetId}/katana`, {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/katana`, {
     cache: "no-store",
   });
-  if (!res.ok) throw new Error("Failed to load scans");
+  if (!res.ok) return [];
   return (await res.json()) as KatanaScanRow[];
 }
 
 async function getFfufScans(targetId: number) {
-  const base = process.env.NEXT_PUBLIC_BACKEND_URL || "http://127.0.0.1:8080";
-  const res = await fetch(`${base}/api/targets/${targetId}/ffuf`, {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/ffuf`, {
     cache: "no-store",
   });
-  if (!res.ok) throw new Error("Failed to load ffuf scans");
+  if (!res.ok) return [];
   return (await res.json()) as FfufScanRow[];
+}
+
+async function getPayloadReconScans(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/payload-recon`, {
+    cache: "no-store",
+  });
+  if (!res.ok) return [];
+  return (await res.json()) as ScanRow[];
+}
+
+async function getNucleiScans(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/nuclei`, {
+    cache: "no-store",
+  });
+  if (!res.ok) return [];
+  return (await res.json()) as ScanRow[];
+}
+
+async function getWhatwebScans(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/whatweb`, {
+    cache: "no-store",
+  });
+  if (!res.ok) return [];
+  return (await res.json()) as ScanRow[];
+}
+
+async function getSubfinderScans(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/subfinder`, {
+    cache: "no-store",
+  });
+  if (!res.ok) return [];
+  return (await res.json()) as ScanRow[];
 }
 
 function formatFlags(flagsJson: string | null) {
@@ -63,6 +102,180 @@ function formatFlags(flagsJson: string | null) {
   }
 }
 
+function ScanTableKatana({
+  title,
+  scans,
+  id,
+  first,
+}: {
+  title: string;
+  scans: KatanaScanRow[];
+  id: number;
+  first?: boolean;
+}) {
+  return (
+    <>
+      <h2 className={`mb-3 text-sm font-semibold text-zinc-900 ${first ? "" : "mt-8"}`}>{title}</h2>
+      <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
+        <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
+          <div className="col-span-2">Scan</div>
+          <div className="col-span-3">Scanned at</div>
+          <div className="col-span-3">Flags</div>
+          <div className="col-span-4">Result</div>
+          <div className="col-span-2">Open</div>
+        </div>
+        <div className="divide-y divide-zinc-100">
+          {scans.length ? (
+            scans.map((s) => (
+              <Link
+                key={s.id}
+                href={`/targets/${id}/katana/${s.id}`}
+                className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
+              >
+                <div className="col-span-2 text-sm font-semibold text-zinc-900">
+                  #{s.id}
+                </div>
+                <div className="col-span-3 text-sm text-zinc-700">{s.scan_at}</div>
+                <div className="col-span-3 truncate text-sm text-zinc-600 font-mono text-[12px]">
+                  {formatFlags(s.flags_json) || "-"}
+                </div>
+                <div className="col-span-4 truncate font-mono text-[12px] text-zinc-600">
+                  {s.result_file}
+                </div>
+                <div className="col-span-2 text-sm font-medium text-sky-700">
+                  Open →
+                </div>
+              </Link>
+            ))
+          ) : (
+            <div className="px-4 py-10 text-sm text-zinc-600">
+              ยังไม่มีประวัติ Katana
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ScanTableFfuf({
+  title,
+  scans,
+  id,
+}: {
+  title: string;
+  scans: FfufScanRow[];
+  id: number;
+}) {
+  return (
+    <>
+      <h2 className="mb-3 mt-8 text-sm font-semibold text-zinc-900">{title}</h2>
+      <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
+        <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
+          <div className="col-span-2">Scan</div>
+          <div className="col-span-3">Scanned at</div>
+          <div className="col-span-3">Wordlist</div>
+          <div className="col-span-4">Result</div>
+          <div className="col-span-2">Open</div>
+        </div>
+        <div className="divide-y divide-zinc-100">
+          {scans.length ? (
+            scans.map((s) => (
+              <Link
+                key={s.id}
+                href={`/targets/${id}/ffuf/${s.id}`}
+                className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
+              >
+                <div className="col-span-2 text-sm font-semibold text-zinc-900">
+                  #{s.id}
+                </div>
+                <div className="col-span-3 text-sm text-zinc-700">{s.scan_at}</div>
+                <div className="col-span-3 text-sm text-zinc-600">
+                  {s.wordlist_source || "-"}
+                </div>
+                <div className="col-span-4 truncate font-mono text-[12px] text-zinc-600">
+                  {s.result_file}
+                </div>
+                <div className="col-span-2 text-sm font-medium text-sky-700">
+                  Open →
+                </div>
+              </Link>
+            ))
+          ) : (
+            <div className="px-4 py-10 text-sm text-zinc-600">
+              ยังไม่มีประวัติ FFuf
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function ScanTableExternal({
+  title,
+  tool,
+  scans,
+  targetId,
+}: {
+  title: string;
+  tool: "nuclei" | "whatweb" | "subfinder" | "payload_recon";
+  scans: { id: number; result_file: string; scan_at: string }[];
+  targetId: number;
+}) {
+  return (
+    <>
+      <h2 className="mb-3 mt-8 text-sm font-semibold text-zinc-900">{title}</h2>
+      <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
+        <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
+          <div className="col-span-2">Scan</div>
+          <div className="col-span-4">Scanned at</div>
+          <div className="col-span-4">Result file</div>
+          <div className="col-span-2">Open</div>
+        </div>
+        <div className="divide-y divide-zinc-100">
+          {scans.length ? (
+            scans.map((s) => {
+              const viewUrl =
+                tool === "payload_recon"
+                  ? `/targets/${targetId}/view?tool=${tool}&path=${encodeURIComponent(s.result_file)}&reconId=${s.id}`
+                  : `/targets/${targetId}/view?tool=${tool}&path=${encodeURIComponent(s.result_file)}`;
+              return (
+                <div
+                  key={s.id}
+                  className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
+                >
+                  <div className="col-span-2 text-sm font-semibold text-zinc-900">
+                    #{s.id}
+                  </div>
+                  <div className="col-span-4 text-sm text-zinc-700">
+                    {s.scan_at}
+                  </div>
+                  <div className="col-span-4 truncate font-mono text-[12px] text-zinc-600">
+                    {s.result_file}
+                  </div>
+                  <div className="col-span-2">
+                    <Link
+                      href={viewUrl}
+                      className="text-sm font-medium text-sky-700 hover:underline"
+                    >
+                      Open →
+                    </Link>
+                  </div>
+                </div>
+              );
+            })
+          ) : (
+            <div className="px-4 py-10 text-sm text-zinc-600">
+              ยังไม่มีประวัติ
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
 export default async function TargetDetailPage({
   params,
 }: {
@@ -70,9 +283,18 @@ export default async function TargetDetailPage({
 }) {
   const { targetId } = await params;
   const id = Number(targetId);
-  const target = Number.isFinite(id) ? await getTargets(id) : null;
-  const scans = Number.isFinite(id) ? await getKatanaScans(id) : [];
-  const ffufScans = Number.isFinite(id) ? await getFfufScans(id) : [];
+  const target = Number.isFinite(id) ? await getTarget(id) : null;
+  const [katanaScans, ffufScans, payloadScans, nucleiScans, whatwebScans, subfinderScans] =
+    Number.isFinite(id)
+      ? await Promise.all([
+          getKatanaScans(id),
+          getFfufScans(id),
+          getPayloadReconScans(id),
+          getNucleiScans(id),
+          getWhatwebScans(id),
+          getSubfinderScans(id),
+        ])
+      : [[], [], [], [], [], []];
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -87,107 +309,22 @@ export default async function TargetDetailPage({
               {target?.target_name || "Unknown target"}
             </p>
           </div>
-          <div className="flex gap-2">
-            <Link
-              href="/targets"
-              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
-            >
-              Back
-            </Link>
-            <Link
-              href="/katana"
-              className="rounded-lg bg-sky-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-sky-700"
-            >
-              Katana
-            </Link>
-            <Link
-              href="/ffuf"
-              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
-            >
-              FFuf
-            </Link>
-          </div>
+          <Link
+            href="/targets"
+            className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm font-medium text-zinc-700 shadow-sm hover:bg-zinc-50"
+          >
+            Back
+          </Link>
         </header>
 
-        <h2 className="mb-3 text-sm font-semibold text-zinc-900">Katana</h2>
-        <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
-          <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
-            <div className="col-span-2">Scan</div>
-            <div className="col-span-3">Scanned at</div>
-            <div className="col-span-5">Flags</div>
-            <div className="col-span-2">Result</div>
-          </div>
-          <div className="divide-y divide-zinc-100">
-            {scans.length ? (
-              scans.map((s) => (
-                <Link
-                  key={s.id}
-                  href={`/targets/${id}/katana/${s.id}`}
-                  className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
-                >
-                  <div className="col-span-2 text-sm font-semibold text-zinc-900">
-                    #{s.id}
-                  </div>
-                  <div className="col-span-3 text-sm text-zinc-700">
-                    {s.scan_at}
-                  </div>
-                  <div className="col-span-5 truncate text-sm text-zinc-600">
-                    <span className="font-mono text-[12px]">
-                      {formatFlags(s.flags_json) || "-"}
-                    </span>
-                  </div>
-                  <div className="col-span-2 truncate text-sm font-medium text-sky-700">
-                    Open →
-                  </div>
-                </Link>
-              ))
-            ) : (
-              <div className="px-4 py-10 text-sm text-zinc-600">
-                ยังไม่มีประวัติ Katana
-              </div>
-            )}
-          </div>
-        </div>
+        <ScanTableKatana title="Katana" scans={katanaScans} id={id} first />
+        <ScanTableFfuf title="FFuf Hidden Path" scans={ffufScans} id={id} />
 
-        <h2 className="mb-3 mt-8 text-sm font-semibold text-zinc-900">FFuf Hidden Path</h2>
-        <div className="rounded-2xl border border-zinc-200 bg-white shadow-sm">
-          <div className="grid grid-cols-12 bg-zinc-50 px-4 py-2 text-[11px] font-semibold text-zinc-600">
-            <div className="col-span-2">Scan</div>
-            <div className="col-span-4">Scanned at</div>
-            <div className="col-span-4">Wordlist</div>
-            <div className="col-span-2">Result</div>
-          </div>
-          <div className="divide-y divide-zinc-100">
-            {ffufScans.length ? (
-              ffufScans.map((s) => (
-                <Link
-                  key={s.id}
-                  href={`/targets/${id}/ffuf/${s.id}`}
-                  className="grid grid-cols-12 gap-3 px-4 py-3 hover:bg-zinc-50"
-                >
-                  <div className="col-span-2 text-sm font-semibold text-zinc-900">
-                    #{s.id}
-                  </div>
-                  <div className="col-span-4 text-sm text-zinc-700">
-                    {s.scan_at}
-                  </div>
-                  <div className="col-span-4 text-sm text-zinc-600">
-                    {s.wordlist_source || "-"}
-                  </div>
-                  <div className="col-span-2 truncate text-sm font-medium text-sky-700">
-                    Open →
-                  </div>
-                </Link>
-              ))
-            ) : (
-              <div className="px-4 py-10 text-sm text-zinc-600">
-                ยังไม่มีประวัติ FFuf
-              </div>
-            )}
-          </div>
-        </div>
+        <ScanTableExternal title="Payload Recon" tool="payload_recon" scans={payloadScans} targetId={id} />
+        <ScanTableExternal title="Nuclei" tool="nuclei" scans={nucleiScans} targetId={id} />
+        <ScanTableExternal title="WhatWeb" tool="whatweb" scans={whatwebScans} targetId={id} />
+        <ScanTableExternal title="Subfinder" tool="subfinder" scans={subfinderScans} targetId={id} />
       </div>
     </div>
   );
 }
-
