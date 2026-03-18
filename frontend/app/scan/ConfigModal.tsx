@@ -2,7 +2,7 @@
 
 import { useRef } from "react";
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan" | "nmap";
 type KatanaFlagDef = {
   name: string;
   label: string;
@@ -57,6 +57,15 @@ type ConfigModalProps = {
   setLanPortsPreset: (v: "top100" | "top1000" | "custom") => void;
   lanCustomPorts: string;
   setLanCustomPorts: (v: string) => void;
+  // Nmap
+  nmapPortPreset: "default" | "fast" | "top100" | "top1000" | "custom";
+  setNmapPortPreset: (v: "default" | "fast" | "top100" | "top1000" | "custom") => void;
+  nmapCustomPorts: string;
+  setNmapCustomPorts: (v: string) => void;
+  nmapTiming: "T3" | "T4" | "T5";
+  setNmapTiming: (v: "T3" | "T4" | "T5") => void;
+  nmapNoPing: boolean;
+  setNmapNoPing: (v: boolean) => void;
 };
 
 export default function ConfigModal({
@@ -99,6 +108,14 @@ export default function ConfigModal({
   setLanPortsPreset,
   lanCustomPorts,
   setLanCustomPorts,
+  nmapPortPreset,
+  setNmapPortPreset,
+  nmapCustomPorts,
+  setNmapCustomPorts,
+  nmapTiming,
+  setNmapTiming,
+  nmapNoPing,
+  setNmapNoPing,
 }: ConfigModalProps) {
   const overlayRef = useRef<HTMLDivElement>(null);
 
@@ -121,7 +138,9 @@ export default function ConfigModal({
               ? "Subfinder"
               : tool === "lan"
                 ? "LAN Scanner"
-                : "Payload Recon";
+                : tool === "nmap"
+                  ? "Nmap"
+                  : "Payload Recon";
   const subtitle =
     tool === "katana"
       ? "ตั้งค่า flags สำหรับ crawl"
@@ -135,7 +154,9 @@ export default function ConfigModal({
             ? "หา subdomains ด้วย subfinder และเช็ค alive ด้วย httpx (เก็บเฉพาะ status 200)"
           : tool === "lan"
             ? "สแกน LAN จาก CIDR แล้วสรุป host + ports"
-            : "รันหลัง Katana/FFuf เสร็จ";
+            : tool === "nmap"
+              ? "ดึง host จาก URL แล้วสแกน port, service version, OS (เพิ่ม option ได้)"
+              : "รันหลัง Katana/FFuf เสร็จ";
 
   return (
     <div
@@ -427,6 +448,68 @@ export default function ConfigModal({
                     className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-mono text-zinc-900"
                   />
                 )}
+              </div>
+            </section>
+          )}
+
+          {tool === "nmap" && (
+            <section className="rounded-2xl border border-zinc-100 bg-zinc-50/50 p-4 space-y-4">
+              <h3 className="text-sm font-semibold text-zinc-800 flex items-center gap-2">
+                <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-teal-100 text-teal-700 text-xs font-bold">N</span>
+                Nmap
+              </h3>
+              <p className="text-xs text-zinc-600">
+                ใช้ URL ด้านบนดึง host แล้วรัน <span className="font-mono">-sV -O --osscan-guess</span> (port, service/version, OS)
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-600">Port</label>
+                  <select
+                    value={nmapPortPreset}
+                    onChange={(e) => setNmapPortPreset(e.target.value as "default" | "fast" | "top100" | "top1000" | "custom")}
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                  >
+                    <option value="default">Default (nmap default ports)</option>
+                    <option value="fast">Fast (-F fewer ports)</option>
+                    <option value="top100">Top 100 (--top-ports 100)</option>
+                    <option value="top1000">Top 1000 (--top-ports 1000)</option>
+                    <option value="custom">Custom (-p ...)</option>
+                  </select>
+                  {nmapPortPreset === "custom" && (
+                    <input
+                      type="text"
+                      value={nmapCustomPorts}
+                      onChange={(e) => setNmapCustomPorts(e.target.value)}
+                      placeholder="80,443 หรือ 1-1000"
+                      className="mt-2 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-mono text-zinc-900"
+                    />
+                  )}
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-zinc-600">Timing (-T)</label>
+                  <select
+                    value={nmapTiming}
+                    onChange={(e) => setNmapTiming(e.target.value as "T3" | "T4" | "T5")}
+                    className="mt-1 w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-800"
+                  >
+                    <option value="T3">T3 (Normal)</option>
+                    <option value="T4">T4 (Aggressive)</option>
+                    <option value="T5">T5 (Insane)</option>
+                  </select>
+                  <p className="mt-1 text-[11px] text-zinc-500">ยิ่งสูงยิ่งเร็ว</p>
+                </div>
+              </div>
+              <div>
+                <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold text-zinc-700">
+                  <input
+                    type="checkbox"
+                    checked={nmapNoPing}
+                    onChange={(e) => setNmapNoPing(e.target.checked)}
+                    className="rounded border-zinc-300 text-teal-600"
+                  />
+                  -Pn (Skip host discovery / treat as online)
+                </label>
+                <p className="mt-1 text-[11px] text-zinc-500">เหมาะกับเว็บที่ block ping</p>
               </div>
             </section>
           )}

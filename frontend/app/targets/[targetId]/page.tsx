@@ -86,6 +86,14 @@ async function getSubfinderScans(targetId: number) {
   return (await res.json()) as ScanRow[];
 }
 
+async function getNmapScans(targetId: number) {
+  const res = await fetch(`${BASE()}/api/targets/${targetId}/nmap`, {
+    cache: "no-store",
+  });
+  if (!res.ok) return [];
+  return (await res.json()) as ScanRow[];
+}
+
 function formatFlags(flagsJson: string | null) {
   if (!flagsJson) return null;
   try {
@@ -219,7 +227,7 @@ function ScanTableExternal({
   targetId,
 }: {
   title: string;
-  tool: "nuclei" | "whatweb" | "subfinder" | "payload_recon";
+  tool: "nuclei" | "whatweb" | "subfinder" | "payload_recon" | "nmap";
   scans: { id: number; result_file: string; scan_at: string }[];
   targetId: number;
 }) {
@@ -284,7 +292,7 @@ export default async function TargetDetailPage({
   const { targetId } = await params;
   const id = Number(targetId);
   const target = Number.isFinite(id) ? await getTarget(id) : null;
-  const [katanaScans, ffufScans, payloadScans, nucleiScans, whatwebScans, subfinderScans] =
+  const [katanaScans, ffufScans, payloadScans, nucleiScans, whatwebScans, subfinderScans, nmapScans] =
     Number.isFinite(id)
       ? await Promise.all([
           getKatanaScans(id),
@@ -293,8 +301,9 @@ export default async function TargetDetailPage({
           getNucleiScans(id),
           getWhatwebScans(id),
           getSubfinderScans(id),
+          getNmapScans(id),
         ])
-      : [[], [], [], [], [], []];
+      : [[], [], [], [], [], [], []];
 
   return (
     <div className="min-h-screen bg-zinc-50 text-zinc-900">
@@ -324,6 +333,7 @@ export default async function TargetDetailPage({
         <ScanTableExternal title="Nuclei" tool="nuclei" scans={nucleiScans} targetId={id} />
         <ScanTableExternal title="WhatWeb" tool="whatweb" scans={whatwebScans} targetId={id} />
         <ScanTableExternal title="Subfinder" tool="subfinder" scans={subfinderScans} targetId={id} />
+        <ScanTableExternal title="Nmap" tool="nmap" scans={nmapScans} targetId={id} />
       </div>
     </div>
   );

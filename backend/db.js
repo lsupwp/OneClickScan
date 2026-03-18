@@ -80,6 +80,15 @@ db.exec(`
     FOREIGN KEY (target_id) REFERENCES target(target_id)
   );
 
+  CREATE TABLE IF NOT EXISTS nmap (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id     INTEGER NOT NULL,
+    result_file   TEXT NOT NULL,
+    scan_at       DATETIME NOT NULL,
+    extra_options TEXT,
+    FOREIGN KEY (target_id) REFERENCES target(target_id)
+  );
+
   CREATE TABLE IF NOT EXISTS payload_tool_run (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     payload_recon_id INTEGER NOT NULL,
@@ -227,6 +236,21 @@ const listSubfinderByTargetStmt = db.prepare(
    ORDER BY id DESC`
 );
 
+const countNmapByTargetStmt = db.prepare(
+  'SELECT COUNT(*) AS count FROM nmap WHERE target_id = ?'
+);
+
+const insertNmapStmt = db.prepare(
+  'INSERT INTO nmap (target_id, result_file, scan_at, extra_options) VALUES (?, ?, ?, ?)'
+);
+
+const listNmapByTargetStmt = db.prepare(
+  `SELECT id, target_id, result_file, scan_at, extra_options
+   FROM nmap
+   WHERE target_id = ?
+   ORDER BY id DESC`
+);
+
 const insertPayloadToolRunStmt = db.prepare(
   `INSERT INTO payload_tool_run (payload_recon_id, tool, cmd, output_file, status, exit_code, started_at, finished_at)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
@@ -356,6 +380,20 @@ function listSubfinderByTarget(targetId) {
   return listSubfinderByTargetStmt.all(targetId);
 }
 
+function getNmapScanRound(targetId) {
+  const { count } = countNmapByTargetStmt.get(targetId);
+  return count + 1;
+}
+
+function insertNmapScan(targetId, resultFile, scanAt, extraOptions = null) {
+  const info = insertNmapStmt.run(targetId, resultFile, scanAt, extraOptions);
+  return info.lastInsertRowid;
+}
+
+function listNmapByTarget(targetId) {
+  return listNmapByTargetStmt.all(targetId);
+}
+
 function insertPayloadToolRun(payloadReconId, tool, cmd, outputFile, status, exitCode, startedAt, finishedAt) {
   const info = insertPayloadToolRunStmt.run(payloadReconId, tool, cmd, outputFile, status, exitCode ?? null, startedAt, finishedAt ?? null);
   return info.lastInsertRowid;
@@ -394,6 +432,9 @@ module.exports = {
   getSubfinderScanRound,
   insertSubfinderScan,
   listSubfinderByTarget,
+  getNmapScanRound,
+  insertNmapScan,
+  listNmapByTarget,
   insertPayloadToolRun,
   updatePayloadToolRun,
   listPayloadToolRunsByRecon,

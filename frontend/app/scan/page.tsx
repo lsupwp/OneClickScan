@@ -3,8 +3,8 @@ import ScanClient from "./ScanClient";
 
 export default function ScanPage() {
   return (
-    <div className="min-h-screen bg-zinc-50 text-zinc-900">
-      <div className="flex h-screen flex-col">
+    <div className="h-screen min-h-screen bg-zinc-50 text-zinc-900">
+      <div className="flex h-full min-h-0 flex-col">
         <header className="flex shrink-0 items-center justify-between border-b border-zinc-200 bg-white px-6 py-4">
           <div>
             <p className="text-sm font-medium text-zinc-500">oneclickscan</p>

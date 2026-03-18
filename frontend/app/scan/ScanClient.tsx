@@ -18,7 +18,7 @@ const WS_URL = () => {
   return b.replace("http://", "ws://");
 };
 
-type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan";
+type ToolId = "katana" | "ffuf" | "payload_recon" | "nuclei" | "whatweb" | "subfinder" | "lan" | "nmap";
 type JobPhase = "idle" | "starting" | "processing" | "scoring" | "done" | "error";
 
 type KatanaFlagDef = {
@@ -59,6 +59,7 @@ export default function ScanClient() {
     whatweb: false,
     subfinder: false,
     lan: false,
+    nmap: false,
   });
 
   const [errorModalMessage, setErrorModalMessage] = useState<string | null>(null);
@@ -131,6 +132,17 @@ export default function ScanClient() {
   const [lanPortsPreset, setLanPortsPreset] = useState<"top100" | "top1000" | "custom">("top100");
   const [lanCustomPorts, setLanCustomPorts] = useState("");
 
+  // Nmap job state
+  const [nmapPhase, setNmapPhase] = useState<JobPhase>("idle");
+  const [nmapStatus, setNmapStatus] = useState("");
+  const [nmapJobId, setNmapJobId] = useState<string | null>(null);
+  const [nmapResultFile, setNmapResultFile] = useState<string | null>(null);
+  const [nmapLogs, setNmapLogs] = useState<string[]>([]);
+  const [nmapPortPreset, setNmapPortPreset] = useState<"default" | "fast" | "top100" | "top1000" | "custom">("default");
+  const [nmapCustomPorts, setNmapCustomPorts] = useState("");
+  const [nmapTiming, setNmapTiming] = useState<"T3" | "T4" | "T5">("T4");
+  const [nmapNoPing, setNmapNoPing] = useState(false);
+
   const [payloadPhase, setPayloadPhase] = useState<"idle" | "running" | "done" | "error">("idle");
   const [payloadEntries, setPayloadEntries] = useState<PayloadEntry[] | null>(null);
   const [payloadResultFile, setPayloadResultFile] = useState<string | null>(null);
@@ -146,6 +158,7 @@ export default function ScanClient() {
   const whatwebWsRef = useRef<WebSocket | null>(null);
   const subfinderWsRef = useRef<WebSocket | null>(null);
   const lanWsRef = useRef<WebSocket | null>(null);
+  const nmapWsRef = useRef<WebSocket | null>(null);
   const payloadReconStartedRef = useRef(false);
 
   const anyRunning =
@@ -167,6 +180,9 @@ export default function ScanClient() {
     lanPhase === "starting" ||
     lanPhase === "processing" ||
     lanPhase === "scoring" ||
+    nmapPhase === "starting" ||
+    nmapPhase === "processing" ||
+    nmapPhase === "scoring" ||
     payloadPhase === "running";
 
   useEffect(() => {
@@ -211,6 +227,7 @@ export default function ScanClient() {
       whatwebWsRef.current?.close();
       subfinderWsRef.current?.close();
       lanWsRef.current?.close();
+      nmapWsRef.current?.close();
     };
   }, []);
 
@@ -367,7 +384,8 @@ export default function ScanClient() {
       selectedTools.payload_recon ||
       selectedTools.nuclei ||
       selectedTools.whatweb ||
-      selectedTools.subfinder;
+      selectedTools.subfinder ||
+      selectedTools.nmap;
     if (runAnyUrlTool) {
       const urlErr = validateUrl(targetUrl);
       if (urlErr) {
@@ -381,7 +399,8 @@ export default function ScanClient() {
     const runWhatweb = selectedTools.whatweb;
     const runSubfinder = selectedTools.subfinder;
     const runLan = selectedTools.lan;
-    if (!runKatana && !runFfuf && !runNuclei && !runWhatweb && !runSubfinder && !runLan) {
+    const runNmap = selectedTools.nmap;
+    if (!runKatana && !runFfuf && !runNuclei && !runWhatweb && !runSubfinder && !runLan && !runNmap) {
       setErrorModalMessage("กรุณาเลือกอย่างน้อย 1 tool");
       return;
     }
@@ -400,6 +419,7 @@ export default function ScanClient() {
     const runWhatweb = selectedTools.whatweb && whatwebPhase !== "done";
     const runSubfinder = selectedTools.subfinder && subfinderPhase !== "done";
     const runLan = selectedTools.lan && lanPhase !== "done";
+    const runNmap = selectedTools.nmap && nmapPhase !== "done";
     if (runFfuf && ffufWordlistMode === "upload" && !ffufUploadedFileId) {
       setErrorModalMessage("กรุณาอัปโหลด wordlist (.txt) สำหรับ FFuf ก่อน");
       return;
@@ -432,6 +452,13 @@ export default function ScanClient() {
       setLanJobId(null);
       setLanResultFile(null);
       setLanLogs([]);
+    }
+    if (runNmap) {
+      setNmapPhase("idle");
+      setNmapStatus("");
+      setNmapJobId(null);
+      setNmapResultFile(null);
+      setNmapLogs([]);
     }
     setPayloadPhase("idle");
     setPayloadEntries(null);
@@ -763,6 +790,81 @@ export default function ScanClient() {
       };
     }
 
+    if (runNmap) {
+      setNmapPhase("starting");
+      setNmapStatus("Connecting...");
+      nmapWsRef.current?.close();
+      const ws = new WebSocket(wsUrl);
+      nmapWsRef.current = ws;
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data as string);
+          if (msg.type === "status") {
+            setNmapPhase(
+              msg.status === "starting" || msg.status === "processing" || msg.status === "scoring"
+                ? msg.status
+                : "starting",
+            );
+            if (msg.message) setNmapStatus(msg.message);
+          } else if (msg.type === "progress" && msg.message?.trim()) {
+            setNmapLogs((prev) => [...prev, msg.message.trimEnd()]);
+          } else if (msg.type === "done") {
+            setNmapPhase("done");
+            setNmapStatus("Done.");
+            if (msg.resultFile) setNmapResultFile(msg.resultFile);
+          } else if (msg.type === "error") {
+            setNmapPhase("error");
+            setNmapStatus(msg.message);
+          }
+        } catch {
+          // ignore
+        }
+      };
+      ws.onopen = async () => {
+        try {
+          const portArg =
+            nmapPortPreset === "default"
+              ? ""
+              : nmapPortPreset === "fast"
+                ? "-F"
+                : nmapPortPreset === "top100"
+                  ? "--top-ports 100"
+                  : nmapPortPreset === "top1000"
+                    ? "--top-ports 1000"
+                    : nmapCustomPorts.trim()
+                      ? `-p ${nmapCustomPorts.trim()}`
+                      : "";
+          const extraParts = [`-${nmapTiming}`, nmapNoPing ? "-Pn" : "", portArg].filter(Boolean);
+          const extraOptions = extraParts.join(" ");
+
+          const res = await fetch(`${backend}/api/scan/nmap`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              target_url: targetUrl.trim(),
+              extra_options: extraOptions || undefined,
+            }),
+          });
+          const data = (await res.json()) as { jobId?: string; error?: string };
+          if (!data.jobId) {
+            setNmapPhase("error");
+            setNmapStatus(data.error || "Failed to start");
+            return;
+          }
+          setNmapJobId(data.jobId);
+          ws.send(JSON.stringify({ type: "subscribe", jobId: data.jobId }));
+          setNmapStatus("Subscribed. Running...");
+        } catch (e) {
+          setNmapPhase("error");
+          setNmapStatus((e as Error).message);
+        }
+      };
+      ws.onerror = () => {
+        setNmapPhase("error");
+        setNmapStatus("WebSocket error");
+      };
+    }
+
   }
 
   function resetKatanaForRescan() {
@@ -794,7 +896,7 @@ export default function ScanClient() {
   function resetAllRound() {
     resetKatanaForRescan();
     resetFfufForRescan();
-    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false, whatweb: false, subfinder: false, lan: false });
+    setSelectedTools({ katana: false, ffuf: false, payload_recon: false, nuclei: false, whatweb: false, subfinder: false, lan: false, nmap: false });
     setNucleiPhase("idle");
     setNucleiStatus("");
     setNucleiJobId(null);
@@ -810,6 +912,11 @@ export default function ScanClient() {
     setSubfinderJobId(null);
     setSubfinderResultFile(null);
     setSubfinderLogs([]);
+    setNmapPhase("idle");
+    setNmapStatus("");
+    setNmapJobId(null);
+    setNmapResultFile(null);
+    setNmapLogs([]);
     setLanPhase("idle");
     setLanStatus("");
     setLanJobId(null);
@@ -917,9 +1024,9 @@ export default function ScanClient() {
         message={errorModalMessage ?? ""}
         onClose={() => setErrorModalMessage(null)}
       />
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 overflow-hidden">
         {/* Sidebar */}
-        <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-200 bg-white p-4">
+        <aside className="flex w-64 shrink-0 flex-col overflow-y-auto border-r border-zinc-200 bg-white p-4">
           <h2 className="text-sm font-semibold text-zinc-800">Tools</h2>
           <p className="mt-1 text-xs text-zinc-500">เลือก tools ที่จะรันในรอบนี้</p>
           <div className="mt-4 space-y-2">
@@ -932,6 +1039,7 @@ export default function ScanClient() {
                 { id: "whatweb" as const, label: "WhatWeb", desc: "Fingerprint (dynamic plugins JSON)" },
                 { id: "subfinder" as const, label: "Subfinder", desc: "Subdomains + httpx (alive 200)" },
                 { id: "lan" as const, label: "LAN Scanner", desc: "สแกน LAN จาก CIDR" },
+                { id: "nmap" as const, label: "Nmap", desc: "Port, service version, OS (จาก URL)" },
               ] as const
             ).map(({ id, label, desc }) => (
               <label
@@ -1170,9 +1278,40 @@ export default function ScanClient() {
                 }
               />
             )}
+
+            {selectedTools.nmap && (
+              <ToolCard
+                label="Nmap"
+                phase={nmapPhase}
+                status={nmapStatus}
+                configSummary={[
+                  nmapPortPreset !== "default" ? (nmapPortPreset === "custom" ? `-p ${nmapCustomPorts || "…"}` : nmapPortPreset === "fast" ? "-F" : `--top-ports ${nmapPortPreset === "top100" ? "100" : "1000"}`) : null,
+                  nmapTiming,
+                  nmapNoPing ? "-Pn" : null,
+                ].filter(Boolean).join(" ") || "-sV -O --osscan-guess"}
+                onClick={() => {
+                  if (nmapPhase === "idle") setConfigModalTool("nmap");
+                  else setOutputModalTool("nmap");
+                }}
+                canClickOutput={nmapPhase === "done" || nmapPhase === "error"}
+                isRunning={nmapPhase === "starting" || nmapPhase === "processing" || nmapPhase === "scoring"}
+                clickable={true}
+                onRescan={
+                  nmapPhase === "done" || nmapPhase === "error"
+                    ? () => {
+                        setNmapPhase("idle");
+                        setNmapStatus("");
+                        setNmapJobId(null);
+                        setNmapResultFile(null);
+                        setNmapLogs([]);
+                      }
+                    : undefined
+                }
+              />
+            )}
           </div>
 
-          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && !selectedTools.whatweb && !selectedTools.subfinder && !selectedTools.lan && (
+          {!selectedTools.katana && !selectedTools.ffuf && !selectedTools.payload_recon && !selectedTools.nuclei && !selectedTools.whatweb && !selectedTools.subfinder && !selectedTools.lan && !selectedTools.nmap && (
             <div className="rounded-2xl border-2 border-dashed border-zinc-200 bg-zinc-50/50 p-12 text-center">
               <p className="text-sm font-medium text-zinc-500">เลือก tools ด้านซ้าย จะเปิด modal ตั้งค่าของ tool นั้น แล้วกด Run เพื่อเริ่มสแกน</p>
             </div>
@@ -1220,6 +1359,14 @@ export default function ScanClient() {
         setLanPortsPreset={setLanPortsPreset}
         lanCustomPorts={lanCustomPorts}
         setLanCustomPorts={setLanCustomPorts}
+        nmapPortPreset={nmapPortPreset}
+        setNmapPortPreset={setNmapPortPreset}
+        nmapCustomPorts={nmapCustomPorts}
+        setNmapCustomPorts={setNmapCustomPorts}
+        nmapTiming={nmapTiming}
+        setNmapTiming={setNmapTiming}
+        nmapNoPing={nmapNoPing}
+        setNmapNoPing={setNmapNoPing}
       />
 
       <OutputModal
@@ -1238,9 +1385,13 @@ export default function ScanClient() {
                   ? (whatwebPhase === "starting" || whatwebPhase === "processing" || whatwebPhase === "scoring" ? "running" : whatwebPhase === "error" ? "error" : "done")
                   : outputModalTool === "subfinder"
                     ? (subfinderPhase === "starting" || subfinderPhase === "processing" || subfinderPhase === "scoring" ? "running" : subfinderPhase === "error" ? "error" : "done")
-              : payloadPhase === "error"
-                ? "error"
-                : "done"
+                    : outputModalTool === "lan"
+                      ? (lanPhase === "starting" || lanPhase === "processing" || lanPhase === "scoring" ? "running" : lanPhase === "error" ? "error" : "done")
+                      : outputModalTool === "nmap"
+                        ? (nmapPhase === "starting" || nmapPhase === "processing" || nmapPhase === "scoring" ? "running" : nmapPhase === "error" ? "error" : "done")
+                        : payloadPhase === "error"
+                          ? "error"
+                          : "done"
         }
         status={
           outputModalTool === "katana"
@@ -1255,7 +1406,9 @@ export default function ScanClient() {
                     ? subfinderStatus
                     : outputModalTool === "lan"
                       ? lanStatus
-                      : payloadPhase === "done"
+                      : outputModalTool === "nmap"
+                        ? nmapStatus
+                        : payloadPhase === "done"
                         ? `พบ ${payloadEntries?.length ?? 0} รายการ`
                         : "เกิดข้อผิดพลาด"
         }
@@ -1272,7 +1425,9 @@ export default function ScanClient() {
                     ? subfinderLogs
                     : outputModalTool === "lan"
                       ? lanLogs
-                      : undefined
+                      : outputModalTool === "nmap"
+                        ? nmapLogs
+                        : undefined
         }
         resultFile={
           outputModalTool === "katana"
@@ -1287,7 +1442,9 @@ export default function ScanClient() {
                     ? subfinderResultFile
                     : outputModalTool === "lan"
                       ? lanResultFile
-                      : null
+                      : outputModalTool === "nmap"
+                        ? nmapResultFile
+                        : null
         }
         backend={backend}
         payloadEntries={outputModalTool === "payload_recon" ? payloadEntries : undefined}

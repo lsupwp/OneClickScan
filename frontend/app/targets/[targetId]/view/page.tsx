@@ -7,6 +7,7 @@ import NucleiOutput from "@/app/scan/output/NucleiOutput";
 import WhatWebOutput from "@/app/scan/output/WhatWebOutput";
 import SubfinderOutput from "@/app/scan/output/SubfinderOutput";
 import PayloadReconOutput from "@/app/scan/output/PayloadReconOutput";
+import NmapOutput from "@/app/scan/output/NmapOutput";
 import type { PayloadEntry } from "@/app/scan/OutputModal";
 
 const BACKEND = () =>
@@ -17,6 +18,7 @@ const TOOL_LABEL: Record<string, string> = {
   whatweb: "WhatWeb",
   subfinder: "Subfinder",
   payload_recon: "Payload Recon",
+  nmap: "Nmap",
 };
 
 function ViewContent({
@@ -67,7 +69,7 @@ function ViewContent({
     );
   }
 
-  if (!["nuclei", "whatweb", "subfinder", "payload_recon"].includes(tool)) {
+  if (!["nuclei", "whatweb", "subfinder", "payload_recon", "nmap"].includes(tool)) {
     return (
       <div className="rounded-2xl border border-zinc-200 bg-white p-8 shadow-sm">
         <p className="text-sm text-red-600">เครื่องมือไม่รองรับ: {tool}</p>
@@ -115,6 +117,9 @@ function ViewContent({
       )}
       {tool === "subfinder" && (
         <SubfinderOutput phase="done" logs={[]} resultFile={path} backend={backend} />
+      )}
+      {tool === "nmap" && (
+        <NmapOutput phase="done" logs={[]} resultFile={path} backend={backend} />
       )}
     </div>
   );

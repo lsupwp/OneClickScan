@@ -14,6 +14,7 @@ const { startNucleiScan } = require('../services/nuclei');
 const { startWhatwebScan } = require('../services/whatweb');
 const { startSubfinderScan } = require('../services/subfinder');
 const { startLanScan } = require('../services/lan-scanner');
+const { startNmapScan } = require('../services/nmap');
 const { startPayloadToolRun } = require('../services/payload-run');
 const {
   listTargets,
@@ -22,6 +23,7 @@ const {
   listNucleiByTarget,
   listWhatwebByTarget,
   listSubfinderByTarget,
+  listNmapByTarget,
   getOrCreateTarget,
   getPayloadReconScanRound,
   insertPayloadRecon,
@@ -146,6 +148,14 @@ router.get('/targets/:targetId/payload-recon', (req, res) => {
   res.status(200).json(listPayloadReconByTarget(targetId));
 });
 
+router.get('/targets/:targetId/nmap', (req, res) => {
+  const targetId = Number(req.params.targetId);
+  if (!Number.isFinite(targetId)) {
+    return res.status(400).json({ error: 'invalid targetId' });
+  }
+  res.status(200).json(listNmapByTarget(targetId));
+});
+
 router.post('/scan/nuclei', async (req, res) => {
   const { target_url: targetUrl } = req.body || {};
   if (!targetUrl || typeof targetUrl !== 'string') {
@@ -191,6 +201,26 @@ router.post('/scan/subfinder', async (req, res) => {
   } catch (err) {
     console.error('Failed to start subfinder scan:', err);
     res.status(500).json({ error: 'Failed to start subfinder scan' });
+  }
+});
+
+router.post('/scan/nmap', async (req, res) => {
+  const { target_url: targetUrl, extra_options: extraOptions } = req.body || {};
+  if (!targetUrl || typeof targetUrl !== 'string') {
+    return res.status(400).json({ error: 'target_url is required' });
+  }
+  const jobId =
+    Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+  try {
+    await startNmapScan({
+      targetUrl: targetUrl.trim(),
+      jobId,
+      extraOptions: typeof extraOptions === 'string' ? extraOptions : '',
+    });
+    res.status(202).json({ jobId });
+  } catch (err) {
+    console.error('Failed to start nmap scan:', err);
+    res.status(500).json({ error: 'Failed to start nmap scan' });
   }
 });
 
